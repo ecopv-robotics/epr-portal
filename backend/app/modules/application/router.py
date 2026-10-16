@@ -1,16 +1,15 @@
-from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies import get_current_user
-from app.models import Application, ApplicationStatus, ApplicationStatusHistory, Company, ServiceTemplate, User
+from app.models import Application, ApplicationStatus, ApplicationStatusHistory, ServiceTemplate, User
 from app.modules.company.router import company_out
 from app.modules.application.service import get_owned_application, reusable_file_for_requirement, transition_application, validate_for_submission
 from app.modules.application.authorization import AuthorizationValidationError, generate_germany_weee_authorization
+from app.modules.application.notifications import notify_staff_new_order, staff_review_recipients
 from app.schemas import (
     ApplicationCreate, ApplicationFormOut, ApplicationList, ApplicationOut, FormFieldOut,
     MaterialFileOut, MaterialRequirementOut, ProductData, StatusHistoryOut, StoreData, TemplateOut,
@@ -23,6 +22,8 @@ def to_out(application: Application) -> ApplicationOut:
     return ApplicationOut(
         id=application.id,
         application_no=application.application_no,
+        purchase_order_id=application.purchase_order_id,
+        instance_index=application.instance_index,
         company_name=application.company.company_name if application.company else None,
         registration_number=application.registration_number,
         certificate_file=application.certificate_file,
@@ -39,6 +40,10 @@ def to_out(application: Application) -> ApplicationOut:
         submitted_time=application.submitted_time,
         reviewed_time=application.reviewed_time,
         review_note=application.review_note,
+        delivery_stage=application.delivery_task.stage if application.delivery_task else None,
+        countersign_note=application.delivery_task.countersign_note if application.delivery_task else None,
+        countersign_file=application.delivery_task.countersign_file if application.delivery_task else None,
+        countersign_required=bool(application.delivery_task and application.delivery_task.stage == "COUNTERSIGN_PENDING"),
     )
 
 
@@ -61,34 +66,10 @@ def create_application(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    template_id = db.scalar(select(ServiceTemplate.id).where(
-        ServiceTemplate.country == payload.country,
-        ServiceTemplate.service_type == payload.service_type,
-        ServiceTemplate.status == "ACTIVE",
-    ))
-    if not template_id:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=422, detail="所选国家与服务组合不可用")
-    company_id = None
-    if payload.company_id is not None:
-        company = db.scalar(select(Company).where(Company.id == payload.company_id, Company.user_id == user.id))
-        if not company:
-            raise HTTPException(status_code=404, detail="企业资料不存在")
-        company_id = company.id
-    application = Application(
-        application_no="PENDING",
-        user_id=user.id,
-        template_id=template_id,
-        company_id=company_id,
-        country=payload.country,
-        service_type=payload.service_type,
-    )
-    db.add(application)
-    db.flush()
-    application.application_no = f"EPR{datetime.now(timezone.utc).year}{application.id:06d}"
-    db.commit()
-    db.refresh(application)
-    return to_out(application)
+    # Service instances are commercial entitlements. Customers can only obtain
+    # them from a paid order; direct draft creation would bypass payment.
+    _ = (payload, db, user)
+    raise HTTPException(status_code=409, detail="请先购买并完成付款，再从订单中的服务实例填写资料")
 
 
 @router.get("/{application_id}", response_model=ApplicationOut)
@@ -151,6 +132,7 @@ def get_application_form(
 @router.post("/{application_id}/submit", response_model=ApplicationOut)
 def submit_application(
     application_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -162,10 +144,13 @@ def submit_application(
     if missing_fields:
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail={"message": "资料不完整", "missing_fields": missing_fields})
-    target = ApplicationStatus.SUBMITTED if application.status == ApplicationStatus.DRAFT else ApplicationStatus.REVIEWING
+    is_resubmission = application.status == ApplicationStatus.NEED_FIX
+    target = ApplicationStatus.REVIEWING if is_resubmission else ApplicationStatus.SUBMITTED
     transition_application(db, application, target, user, "客户提交申请" if target == ApplicationStatus.SUBMITTED else "客户补件后重新提交")
     db.commit()
     db.refresh(application)
+    recipients = staff_review_recipients(db, application)
+    background_tasks.add_task(notify_staff_new_order, recipients, application.application_no, is_resubmission)
     return to_out(application)
 
 

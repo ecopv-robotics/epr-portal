@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -6,20 +8,35 @@ from app.core.database import get_db
 from app.core.security import hash_password
 from app.dependencies import get_current_admin
 from app.models import (
-    Application, ApplicationAssignment, ApplicationStatus, ApplicationStatusHistory, AuditRecord,
-    Company, CustomerProfile, CustomerType, Employee, FormField, MaterialRequirement, Role, ServiceTemplate, User, UserRole,
+    Application, ApplicationAssignment, ApplicationStatus, ApplicationStatusHistory, AuditRecord, CountryResponsibility, DeliveryTask,
+    Company, CustomerProfile, CustomerType, Employee, FormField, MaterialRequirement, PurchaseOrder,
+    PurchaseOrderStatus, Role, ServiceTemplate, User, UserRole,
 )
 from app.modules.application.router import to_out
-from app.modules.application.service import reusable_file_for_requirement, transition_application
+from app.modules.portal.router import activate_paid_order, calculate_unit_price, normalize_product_configurations, purchase_order_out
+from app.modules.application.service import assign_country_delivery_owner, reusable_file_for_requirement, transition_application
+from app.modules.application.notifications import notify_customer_update
 from app.modules.company.router import company_out
+from app.portal_catalog import PORTAL_SERVICE_BY_ID
 from app.schemas import (
-    AdminStatusUpdate, ApplicationFormOut, ApplicationList, ApplicationOut, AssignmentOut, AssignmentUpdate,
-    AuditRecordOut, DashboardOut, EmployeeOut, FormFieldOut, MaterialFileOut, MaterialRequirementOut,
+    AdminContractUpdate, AdminOrderCreate, AdminPackageDiscount, AdminPaymentReview, AdminPurchaseOrderOut, AdminStatusUpdate, ApplicationFormOut, ApplicationList,
+    ApplicationOut, AssignmentOut, AssignmentUpdate,
+    AuditRecordOut, CountryResponsibilityOut, CountryResponsibilityUpdate, DashboardOut, DeliveryDashboardTaskOut, DeliveryTaskOut, DeliveryTaskUpdate, EmployeeOut, FormFieldOut, MaterialFileOut, MaterialRequirementOut,
     CompanyProfileOut, CustomerAccountCreate, CustomerAccountDetailOut, CustomerAccountOut, CustomerAccountUpdate, ProductData, StatusHistoryOut, StoreData,
     TemplateConfigUpdate, TemplateOut,
 )
 
 router = APIRouter(prefix="/admin", tags=["后台审核"])
+
+
+def admin_purchase_order_out(order: PurchaseOrder) -> AdminPurchaseOrderOut:
+    base = purchase_order_out(order).model_dump()
+    profile = order.user.customer_profile
+    return AdminPurchaseOrderOut(
+        **base,
+        customer_name=profile.name if profile else order.user.username,
+        customer_account=order.user.email or order.user.phone or order.user.username,
+    )
 
 
 def get_employee(db: Session, user: User) -> Employee:
@@ -40,13 +57,199 @@ def require_any_permission(employee: Employee, *permissions: str) -> None:
 
 
 def get_application_or_404(db: Session, application_id: int) -> Application:
-    application = db.scalar(select(Application).where(
-        Application.id == application_id,
-        Application.status != ApplicationStatus.DRAFT,
-    ))
+    application = db.get(Application, application_id)
     if not application:
         raise HTTPException(status_code=404, detail="递单不存在")
     return application
+
+
+def delivery_task_out(application: Application) -> DeliveryTaskOut | None:
+    task = application.delivery_task
+    if not task and application.status not in (ApplicationStatus.REGISTERING, ApplicationStatus.COMPLETED):
+        return None
+    return DeliveryTaskOut(
+        id=task.id if task else None,
+        application_id=application.id,
+        stage=task.stage if task else "RECEIVED",
+        service_provider=task.service_provider if task else None,
+        provider_reference=task.provider_reference if task else None,
+        provider_submission_file=task.provider_submission_file if task else None,
+        provider_submitted_time=task.provider_submitted_time if task else None,
+        supplement_note=task.supplement_note if task else None,
+        supplement_file=task.supplement_file if task else None,
+        countersign_note=task.countersign_note if task else None,
+        countersign_file=task.countersign_file if task else None,
+        delivery_note=task.delivery_note if task else None,
+        updated_by_name=task.updated_by.display_name if task and task.updated_by else None,
+        updated_time=task.updated_time if task else None,
+    )
+
+
+@router.get("/orders", response_model=list[AdminPurchaseOrderOut])
+def list_purchase_orders(
+    status: PurchaseOrderStatus | None = None,
+    keyword: str | None = Query(None, max_length=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_admin),
+):
+    require_any_permission(
+        get_employee(db, user), "order.create", "discount.approve", "contract.manage", "payment.review"
+    )
+    query = select(PurchaseOrder).join(User, PurchaseOrder.user_id == User.id).outerjoin(CustomerProfile)
+    if status:
+        query = query.where(PurchaseOrder.status == status)
+    if keyword:
+        pattern = f"%{keyword.strip()}%"
+        query = query.where(or_(
+            PurchaseOrder.order_no.ilike(pattern),
+            User.username.ilike(pattern),
+            User.email.ilike(pattern),
+            CustomerProfile.name.ilike(pattern),
+        ))
+    orders = db.scalars(query.order_by(PurchaseOrder.created_time.desc())).unique().all()
+    return [admin_purchase_order_out(order) for order in orders]
+
+
+@router.get("/orders/{order_id}", response_model=AdminPurchaseOrderOut)
+def get_purchase_order(order_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_admin)):
+    require_any_permission(
+        get_employee(db, user), "order.create", "discount.approve", "contract.manage", "payment.review"
+    )
+    order = db.get(PurchaseOrder, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    return admin_purchase_order_out(order)
+
+
+@router.post("/orders", response_model=AdminPurchaseOrderOut, status_code=201)
+def create_order_for_customer(
+    payload: AdminOrderCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_admin),
+):
+    employee = get_employee(db, user)
+    require_permission(employee, "order.create")
+    customer = db.get(User, payload.user_id)
+    if not customer or customer.role != UserRole.CUSTOMER:
+        raise HTTPException(status_code=404, detail="客户账号不存在")
+    service = PORTAL_SERVICE_BY_ID.get(payload.service_id)
+    if not service:
+        raise HTTPException(status_code=404, detail="服务不存在或已下架")
+    if payload.service_year not in service["service_years"]:
+        raise HTTPException(status_code=422, detail="商品服务年度无效")
+    package_type, product_configurations = normalize_product_configurations(service, payload.package_type, payload.product_configurations)
+    unit_price = calculate_unit_price(service, product_configurations)
+    standard_amount = unit_price * payload.quantity
+    order = PurchaseOrder(
+        order_no="PENDING", user_id=customer.id, service_id=payload.service_id,
+        service_year=payload.service_year, subject_type="", package_type=package_type,
+        product_configurations=product_configurations,
+        quantity=payload.quantity, unit_price=unit_price, standard_amount=standard_amount,
+        discount_amount=0, total_amount=standard_amount,
+    )
+    db.add(order)
+    db.flush()
+    order.order_no = f"ORD{datetime.now(timezone.utc).year}{order.id:08d}"
+    db.add(AuditRecord(employee_id=employee.id, action="ORDER_CREATED_FOR_CUSTOMER", detail={"order_id": order.id, "customer_id": customer.id}))
+    db.commit()
+    db.refresh(order)
+    return admin_purchase_order_out(order)
+
+
+@router.post("/orders/package-discount", response_model=list[AdminPurchaseOrderOut])
+def approve_package_discount(
+    payload: AdminPackageDiscount,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_admin),
+):
+    employee = get_employee(db, user)
+    require_permission(employee, "discount.approve")
+    orders = db.scalars(select(PurchaseOrder).where(PurchaseOrder.id.in_(payload.order_ids)).with_for_update()).all()
+    if len(orders) != len(set(payload.order_ids)):
+        raise HTTPException(status_code=404, detail="存在无效订单")
+    if any(order.status != PurchaseOrderStatus.PENDING for order in orders):
+        raise HTTPException(status_code=409, detail="仅待付款订单可以调整优惠")
+    if len({order.user_id for order in orders}) != 1:
+        raise HTTPException(status_code=422, detail="打包优惠只能应用于同一客户")
+    standards = [order.standard_amount or order.unit_price * order.quantity for order in orders]
+    standard_total = sum(standards)
+    if payload.package_total > standard_total:
+        raise HTTPException(status_code=422, detail="打包价不能高于标准总价")
+    allocated = 0
+    batch_no = orders[0].batch_no or f"BAT{datetime.now(timezone.utc).year}{min(order.id for order in orders):08d}"
+    for index, (order, standard) in enumerate(zip(orders, standards)):
+        final_amount = payload.package_total - allocated if index == len(orders) - 1 else round(payload.package_total * standard / standard_total)
+        allocated += final_amount
+        order.batch_no = batch_no
+        order.standard_amount = standard
+        order.discount_amount = standard - final_amount
+        order.total_amount = final_amount
+        order.discount_reason = payload.reason
+    db.add(AuditRecord(employee_id=employee.id, action="PACKAGE_DISCOUNT_APPROVED", detail={"order_ids": payload.order_ids, "standard_total": standard_total, "package_total": payload.package_total, "reason": payload.reason}))
+    db.commit()
+    for order in orders:
+        db.refresh(order)
+    return [admin_purchase_order_out(order) for order in orders]
+
+
+@router.put("/orders/{order_id}/contract", response_model=AdminPurchaseOrderOut)
+def upload_order_contract(
+    order_id: int,
+    payload: AdminContractUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_admin),
+):
+    employee = get_employee(db, user)
+    require_permission(employee, "contract.manage")
+    order = db.get(PurchaseOrder, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    targets = [order]
+    if order.batch_no:
+        targets = db.scalars(select(PurchaseOrder).where(
+            PurchaseOrder.user_id == order.user_id, PurchaseOrder.batch_no == order.batch_no
+        ).with_for_update()).all()
+    for target in targets:
+        target.contract_no = payload.contract_no
+        target.contract_file = payload.contract_file
+        target.contract_version = payload.contract_version
+    db.add(AuditRecord(employee_id=employee.id, action="ORDER_CONTRACT_UPDATED", detail={"order_id": order.id, "synced_order_ids": [target.id for target in targets], "contract_no": payload.contract_no, "version": payload.contract_version}))
+    db.commit()
+    db.refresh(order)
+    return admin_purchase_order_out(order)
+
+
+@router.post("/orders/{order_id}/payment-review", response_model=AdminPurchaseOrderOut)
+def review_offline_payment(
+    order_id: int,
+    payload: AdminPaymentReview,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_admin),
+):
+    employee = get_employee(db, user)
+    require_permission(employee, "payment.review")
+    order = db.scalar(select(PurchaseOrder).where(PurchaseOrder.id == order_id).with_for_update())
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.status != PurchaseOrderStatus.PAYMENT_CONFIRMING:
+        raise HTTPException(status_code=409, detail="订单不在付款待确认状态")
+    if payload.approved:
+        if payload.actual_paid_amount is None or not payload.finance_receipt:
+            raise HTTPException(status_code=422, detail="确认到账必须填写实际到账金额并上传财务收款凭证")
+        if payload.actual_paid_amount != order.total_amount:
+            raise HTTPException(status_code=422, detail="实际到账金额与订单应付金额不一致")
+        order.actual_paid_amount = payload.actual_paid_amount
+        order.finance_receipt = payload.finance_receipt
+        order.finance_note = payload.note
+        activate_paid_order(db, order, order.user)
+        action = "OFFLINE_PAYMENT_APPROVED"
+    else:
+        order.status = PurchaseOrderStatus.PAYMENT_FAILED
+        action = "OFFLINE_PAYMENT_REJECTED"
+    db.add(AuditRecord(employee_id=employee.id, action=action, detail={"order_id": order.id, "note": payload.note}))
+    db.commit()
+    db.refresh(order)
+    return admin_purchase_order_out(order)
 
 
 @router.get("/applications", response_model=ApplicationList)
@@ -56,11 +259,11 @@ def list_for_review(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
+    user: User = Depends(get_current_admin),
 ):
+    require_any_permission(get_employee(db, user), "application.review", "application.deliver", "application.assign")
     query = (select(Application).outerjoin(Company).outerjoin(User, Application.user_id == User.id)
-             .outerjoin(CustomerProfile, CustomerProfile.user_id == User.id)
-             .where(Application.status != ApplicationStatus.DRAFT))
+             .outerjoin(CustomerProfile, CustomerProfile.user_id == User.id))
     if status:
         query = query.where(Application.status == status)
     if keyword:
@@ -132,6 +335,11 @@ def update_customer_account(db: Session, profile_id: int, customer_type: Custome
     profile = db.scalar(select(CustomerProfile).where(CustomerProfile.id == profile_id, CustomerProfile.customer_type == customer_type))
     if not profile:
         raise HTTPException(status_code=404, detail="客户账号不存在")
+    email = str(payload.email)
+    email_owner = db.scalar(select(User.id).where(User.email == email, User.id != profile.user_id))
+    if email_owner:
+        raise HTTPException(status_code=409, detail="邮箱已被其他账号使用")
+    profile.user.email = email
     profile.name, profile.contact_name, profile.contact_phone, profile.active = payload.name, payload.contact_name, payload.contact_phone, payload.active
     db.commit(); db.refresh(profile)
     count = db.scalar(select(func.count(Application.id)).where(Application.user_id == profile.user_id)) or 0
@@ -190,8 +398,9 @@ def update_direct_customer(profile_id: int, payload: CustomerAccountUpdate, db: 
 def review_detail(
     application_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
+    user: User = Depends(get_current_admin),
 ):
+    require_any_permission(get_employee(db, user), "application.review", "application.deliver", "application.assign")
     application = get_application_or_404(db, application_id)
     template = application.template or db.scalar(select(ServiceTemplate).where(
         ServiceTemplate.country == application.country,
@@ -223,6 +432,7 @@ def review_detail(
         store=StoreData.model_validate(application.store, from_attributes=True) if application.store else None,
         products=[ProductData(id=item.id, product_data=item.product_data) for item in application.products],
         material_files=[*explicit_files.values(), *synced_files],
+        delivery=delivery_task_out(application),
     )
 
 
@@ -230,32 +440,61 @@ def review_detail(
 def update_review_status(
     application_id: int,
     payload: AdminStatusUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_admin),
 ):
     application = get_application_or_404(db, application_id)
+    employee = get_employee(db, admin)
     transitions = {
-        ApplicationStatus.SUBMITTED: {ApplicationStatus.REVIEWING},
+        # 客户提交即进入待审核，商务可直接给出结论，无需“开始审核”动作。
+        ApplicationStatus.SUBMITTED: {ApplicationStatus.NEED_FIX, ApplicationStatus.REGISTERING},
         ApplicationStatus.REVIEWING: {ApplicationStatus.NEED_FIX, ApplicationStatus.REGISTERING},
         ApplicationStatus.REGISTERING: {ApplicationStatus.COMPLETED},
+        ApplicationStatus.COMPLETED: {ApplicationStatus.COMPLETED},
     }
     if payload.status not in transitions.get(application.status, set()):
         raise HTTPException(status_code=409, detail=f"不允许从 {application.status.value} 转为 {payload.status.value}")
+    if payload.status in (ApplicationStatus.REVIEWING, ApplicationStatus.NEED_FIX, ApplicationStatus.REGISTERING):
+        require_permission(employee, "application.review")
+    elif payload.status == ApplicationStatus.COMPLETED:
+        require_permission(employee, "application.deliver")
     if payload.status == ApplicationStatus.NEED_FIX and not payload.note:
         raise HTTPException(status_code=422, detail="要求补资料时必须填写审核意见")
-    if payload.status == ApplicationStatus.COMPLETED:
-        if not payload.registration_number:
+    result_files_updated = payload.status == ApplicationStatus.COMPLETED
+    if result_files_updated:
+        if application.status == ApplicationStatus.REGISTERING and (
+            not application.delivery_task or application.delivery_task.stage != "COUNTERSIGNED"
+        ):
+            raise HTTPException(status_code=409, detail="请先完成服务商递交、补件跟进和二次回签流程")
+        if not payload.registration_number and not application.registration_number:
             raise HTTPException(status_code=422, detail="审核通过时必须填写下证注册号")
-        application.registration_number = payload.registration_number
-        application.certificate_file = payload.certificate_file
-        application.invoice_file = payload.invoice_file
-        application.result_file = payload.result_file
-        application.service_expiry_date = payload.service_expiry_date
-    employee = get_employee(db, admin)
+        application.registration_number = payload.registration_number or application.registration_number
+        application.certificate_file = payload.certificate_file if payload.certificate_file is not None else application.certificate_file
+        application.invoice_file = payload.invoice_file if payload.invoice_file is not None else application.invoice_file
+        application.result_file = payload.result_file if payload.result_file is not None else application.result_file
+        application.service_expiry_date = payload.service_expiry_date or application.service_expiry_date or f"{datetime.now(timezone.utc).year}-12-31"
+        task = application.delivery_task
+        if not task:
+            task = DeliveryTask(application_id=application.id)
+            application.delivery_task = task
+        task.stage = "COMPLETED"
+        task.updated_by_id = employee.id
+        task.delivery_note = payload.note or task.delivery_note
+    if payload.status == ApplicationStatus.REGISTERING:
+        task = DeliveryTask(application_id=application.id, stage="RECEIVED", updated_by_id=employee.id)
+        application.delivery_task = task
+        delivery_employee = assign_country_delivery_owner(db, application, employee.id)
+        if delivery_employee:
+            db.add(AuditRecord(application_id=application.id, employee_id=employee.id, action="DELIVERY_AUTO_ASSIGN", detail={"employee_id": delivery_employee.id, "employee_name": delivery_employee.display_name}))
     transition_application(db, application, payload.status, admin, payload.note)
     db.add(AuditRecord(application_id=application.id, employee_id=employee.id, action="STATUS_CHANGE", detail={"to_status": payload.status.value, "note": payload.note}))
     db.commit()
     db.refresh(application)
+    background_tasks.add_task(
+        notify_customer_update, application.user.email, application.application_no,
+        application.status, payload.note, result_files_updated,
+    )
     return to_out(application)
 
 
@@ -263,8 +502,9 @@ def update_review_status(
 def review_status_history(
     application_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
+    user: User = Depends(get_current_admin),
 ):
+    require_any_permission(get_employee(db, user), "application.review", "application.deliver", "application.assign")
     application = get_application_or_404(db, application_id)
     items = db.scalars(select(ApplicationStatusHistory).where(
         ApplicationStatusHistory.application_id == application.id
@@ -291,19 +531,96 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(get_current_ad
             Application.status != ApplicationStatus.DRAFT,
         )
     ) or 0
+    delivery_stage_counts: dict[str, int] = {}
+    delivery_tasks: list[DeliveryDashboardTaskOut] = []
+    if employee.role.code == "DELIVERY":
+        assigned_applications = db.scalars(
+            select(Application)
+            .join(ApplicationAssignment)
+            .where(
+                ApplicationAssignment.employee_id == employee.id,
+                Application.status.in_((ApplicationStatus.REGISTERING, ApplicationStatus.COMPLETED)),
+            )
+            .order_by(Application.created_time.desc())
+        ).all()
+        for application in assigned_applications:
+            stage = application.delivery_task.stage if application.delivery_task else (
+                "COMPLETED" if application.status == ApplicationStatus.COMPLETED else "RECEIVED"
+            )
+            delivery_stage_counts[stage] = delivery_stage_counts.get(stage, 0) + 1
+            delivery_tasks.append(DeliveryDashboardTaskOut(
+                application_id=application.id,
+                application_no=application.application_no,
+                company_name=application.company.company_name if application.company else None,
+                country=application.country,
+                service_type=application.service_type,
+                stage=stage,
+                updated_time=(application.delivery_task.updated_time if application.delivery_task else application.created_time),
+            ))
+        stage_order = {"RECEIVED": 0, "PROVIDER_SUBMITTED": 1, "SUPPLEMENT_FOLLOW_UP": 2, "COUNTERSIGN_PENDING": 3, "COUNTERSIGNED": 4, "COMPLETED": 5}
+        delivery_tasks.sort(key=lambda item: (stage_order.get(item.stage, 99), -item.updated_time.timestamp()))
     return DashboardOut(
         total=sum(counts.values()), submitted=counts.get(ApplicationStatus.SUBMITTED, 0),
         reviewing=counts.get(ApplicationStatus.REVIEWING, 0), need_fix=counts.get(ApplicationStatus.NEED_FIX, 0),
         completed=counts.get(ApplicationStatus.COMPLETED, 0), my_tasks=my_tasks,
+        role_code=employee.role.code, delivery_stage_counts=delivery_stage_counts, delivery_tasks=delivery_tasks,
     )
 
 
 @router.get("/employees", response_model=list[EmployeeOut])
-def employees(db: Session = Depends(get_db), user: User = Depends(get_current_admin)):
+def employees(role_code: str | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_admin)):
     current = get_employee(db, user)
     require_permission(current, "application.assign")
-    items = db.scalars(select(Employee).where(Employee.active.is_(True)).order_by(Employee.display_name)).all()
+    query = select(Employee).where(Employee.active.is_(True))
+    if role_code:
+        query = query.join(Role).where(Role.code == role_code)
+    items = db.scalars(query.order_by(Employee.display_name)).all()
     return [EmployeeOut(id=item.id, username=item.user.username, email=item.user.email, display_name=item.display_name, active=item.active, role=item.role) for item in items]
+
+
+@router.get("/profile", response_model=EmployeeOut)
+def employee_profile(db: Session = Depends(get_db), user: User = Depends(get_current_admin)):
+    item = get_employee(db, user)
+    return EmployeeOut(id=item.id, username=item.user.username, email=item.user.email, display_name=item.display_name, active=item.active, role=item.role)
+
+
+def country_responsibility_out(item: CountryResponsibility) -> CountryResponsibilityOut:
+    return CountryResponsibilityOut(
+        id=item.id, country=item.country,
+        delivery_employee_id=item.delivery_employee_id, delivery_employee_name=item.delivery_employee.display_name,
+    )
+
+
+@router.get("/country-responsibilities", response_model=list[CountryResponsibilityOut])
+def country_responsibilities(db: Session = Depends(get_db), user: User = Depends(get_current_admin)):
+    require_permission(get_employee(db, user), "employee.manage")
+    items = db.scalars(select(CountryResponsibility).order_by(CountryResponsibility.country)).all()
+    return [country_responsibility_out(item) for item in items]
+
+
+@router.put("/country-responsibilities/{country}", response_model=CountryResponsibilityOut)
+def update_country_responsibility(
+    country: str,
+    payload: CountryResponsibilityUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_admin),
+):
+    actor = get_employee(db, user)
+    require_permission(actor, "employee.manage")
+    expected = {"delivery_employee_id": "DELIVERY"}
+    for field, role_code in expected.items():
+        employee = db.get(Employee, getattr(payload, field))
+        if not employee or not employee.active or employee.role.code != role_code:
+            raise HTTPException(status_code=422, detail=f"{role_code} 负责人无效")
+    item = db.scalar(select(CountryResponsibility).where(CountryResponsibility.country == country))
+    if not item:
+        item = CountryResponsibility(country=country, **payload.model_dump())
+        db.add(item)
+    else:
+        for field, value in payload.model_dump().items(): setattr(item, field, value)
+    db.add(AuditRecord(employee_id=actor.id, action="COUNTRY_RESPONSIBILITY_UPDATE", detail={"country": country, **payload.model_dump()}))
+    db.commit(); db.refresh(item)
+    return country_responsibility_out(item)
 
 
 @router.put("/applications/{application_id}/assignment", response_model=AssignmentOut)
@@ -314,6 +631,9 @@ def assign_application(application_id: int, payload: AssignmentUpdate, db: Sessi
     assignee = db.get(Employee, payload.employee_id)
     if not assignee or not assignee.active:
         raise HTTPException(status_code=422, detail="所选员工不存在或已停用")
+    expected_role = "DELIVERY" if application.status in (ApplicationStatus.REGISTERING, ApplicationStatus.COMPLETED) else "BUSINESS"
+    if assignee.role.code != expected_role:
+        raise HTTPException(status_code=422, detail="当前阶段只能分配给交付人员" if expected_role == "DELIVERY" else "当前阶段只能分配给商务审核人员")
     assignment = db.scalar(select(ApplicationAssignment).where(ApplicationAssignment.application_id == application.id))
     if assignment:
         assignment.employee_id, assignment.assigned_by_id = assignee.id, actor.id
@@ -327,15 +647,66 @@ def assign_application(application_id: int, payload: AssignmentUpdate, db: Sessi
 
 @router.get("/applications/{application_id}/assignment", response_model=AssignmentOut | None)
 def get_assignment(application_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_admin)):
-    get_employee(db, user); get_application_or_404(db, application_id)
+    employee = get_employee(db, user)
+    require_any_permission(employee, "application.review", "application.deliver", "application.assign")
+    get_application_or_404(db, application_id)
     item = db.scalar(select(ApplicationAssignment).where(ApplicationAssignment.application_id == application_id))
     if not item: return None
     return AssignmentOut(id=item.id, application_id=item.application_id, employee_id=item.employee_id, employee_name=item.employee.display_name, assigned_by_name=item.assigned_by.display_name, assigned_time=item.assigned_time)
 
 
+@router.put("/applications/{application_id}/delivery", response_model=DeliveryTaskOut)
+def update_delivery_task(
+    application_id: int,
+    payload: DeliveryTaskUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_admin),
+):
+    employee = get_employee(db, user)
+    require_permission(employee, "application.deliver")
+    application = get_application_or_404(db, application_id)
+    if application.status != ApplicationStatus.REGISTERING:
+        raise HTTPException(status_code=409, detail="仅注册办理中的服务可以更新交付进度")
+    stages = ["RECEIVED", "PROVIDER_SUBMITTED", "SUPPLEMENT_FOLLOW_UP", "COUNTERSIGN_PENDING", "COUNTERSIGNED"]
+    task = application.delivery_task
+    if not task:
+        task = DeliveryTask(application_id=application.id, stage="RECEIVED")
+        application.delivery_task = task
+    if stages.index(payload.stage) < stages.index(task.stage):
+        raise HTTPException(status_code=409, detail="交付进度不能回退")
+    skip_customer_countersign = (
+        task.stage == "SUPPLEMENT_FOLLOW_UP" and payload.stage == "COUNTERSIGNED"
+        and bool(payload.countersign_note and "无需" in payload.countersign_note)
+    )
+    if stages.index(payload.stage) > stages.index(task.stage) + 1 and not skip_customer_countersign:
+        raise HTTPException(status_code=409, detail="请按交付流程顺序完成当前步骤")
+    if payload.stage in ("PROVIDER_SUBMITTED", "SUPPLEMENT_FOLLOW_UP", "COUNTERSIGN_PENDING", "COUNTERSIGNED") and not (payload.service_provider or task.service_provider):
+        raise HTTPException(status_code=422, detail="请先填写服务商名称")
+    if payload.stage == "COUNTERSIGN_PENDING" and not payload.countersign_note:
+        raise HTTPException(status_code=422, detail="请填写发送给客户的二次回签说明")
+    if payload.stage == "COUNTERSIGNED" and task.stage != "COUNTERSIGN_PENDING" and not skip_customer_countersign:
+        raise HTTPException(status_code=409, detail="二次回签文件必须由客户上传完成")
+    task.stage = payload.stage
+    for field in (
+        "service_provider", "provider_reference", "provider_submission_file", "supplement_note",
+        "supplement_file", "countersign_note", "countersign_file", "delivery_note",
+    ):
+        value = getattr(payload, field)
+        if value is not None:
+            setattr(task, field, value)
+    if payload.stage == "PROVIDER_SUBMITTED" and not task.provider_submitted_time:
+        task.provider_submitted_time = datetime.now(timezone.utc)
+    task.updated_by_id = employee.id
+    db.add(AuditRecord(application_id=application.id, employee_id=employee.id, action="DELIVERY_PROGRESS", detail={"stage": payload.stage, "service_provider": task.service_provider, "note": task.delivery_note}))
+    db.commit(); db.refresh(task)
+    return delivery_task_out(application)
+
+
 @router.get("/applications/{application_id}/audit-records", response_model=list[AuditRecordOut])
 def audit_records(application_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_admin)):
-    get_employee(db, user); get_application_or_404(db, application_id)
+    employee = get_employee(db, user)
+    require_any_permission(employee, "application.review", "application.deliver", "application.assign")
+    get_application_or_404(db, application_id)
     items = db.scalars(select(AuditRecord).where(AuditRecord.application_id == application_id).order_by(AuditRecord.created_time.desc())).all()
     return [AuditRecordOut(id=item.id, action=item.action, detail=item.detail, employee_name=item.employee.display_name, created_time=item.created_time) for item in items]
 

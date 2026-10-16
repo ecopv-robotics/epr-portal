@@ -11,6 +11,7 @@ from app.modules.admin.router import router as admin_router
 from app.modules.company.router import router as company_router
 from app.modules.material.router import router as material_router
 from app.modules.product.router import router as product_router
+from app.modules.portal.router import router as portal_router
 from app.modules.store.router import router as store_router
 from app.modules.template.router import router as template_router
 from app.modules.user.router import router as user_router
@@ -43,6 +44,7 @@ app.include_router(company_router, prefix=settings.api_prefix)
 app.include_router(store_router, prefix=settings.api_prefix)
 app.include_router(product_router, prefix=settings.api_prefix)
 app.include_router(material_router, prefix=settings.api_prefix)
+app.include_router(portal_router, prefix=settings.api_prefix)
 app.include_router(admin_router, prefix=settings.api_prefix)
 app.mount("/files", StaticFiles(directory=settings.storage_path, check_dir=False), name="files")
 

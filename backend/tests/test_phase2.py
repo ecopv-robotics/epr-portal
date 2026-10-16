@@ -1,12 +1,17 @@
+from tests.helpers import confirm_offline_payment
+
+
 def login(client):
     response = client.post("/api/auth/login", json={"account": "demo@eprflow.com", "password": "Demo123!"})
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
-def create_application(client, headers):
-    response = client.post("/api/applications", json={"country": "Germany", "service_type": "WEEE"}, headers=headers)
-    assert response.status_code == 201
-    return response.json()["id"]
+def create_application(client, headers, service_id="de-weee"):
+    order = client.post("/api/portal/orders", json={"service_id": service_id, "service_year": "2026年（自然年）", "quantity": 1}, headers=headers)
+    assert order.status_code == 201
+    response = confirm_offline_payment(client, headers, order)
+    assert response.status_code == 200
+    return response.json()["service_instances"][0]["id"]
 
 
 def test_europe_catalog_and_phase2_form_flow(client):
@@ -27,10 +32,10 @@ def test_europe_catalog_and_phase2_form_flow(client):
     category_field = germany_weee_fields[0]
     assert category_field["required"] is True
     assert category_field["options"] == [
-        "热交换设备", "屏幕设备", "气体放电灯", "非气体放电灯",
-        "大型设备，单边尺寸大于50cm", "小型设备，单边尺寸小于50cm",
-        "小型信息和电信设备", "大型光伏，单边尺寸大于50cm",
-        "小型光伏，单边尺寸小于50cm",
+        "热交换器 家用", "充气灯 家用", "大型光伏 家用", "非充气灯 家用", "屏幕类 家用",
+        "大型非光伏 家用", "小型非光伏 家用", "小型光伏 家用", "小型IT 家用",
+        "热交换器 商用", "屏幕类 商用", "灯 商用", "大型非光伏 商用", "大型光伏 商用",
+        "小型非光伏 商用", "小型光伏 商用", "小型IT 商用",
     ]
     assert germany_weee_fields[-1]["required"] is False
     requirement_id = form.json()["template"]["materials"][0]["id"]
@@ -59,7 +64,7 @@ def test_europe_catalog_and_phase2_form_flow(client):
     assert store.status_code == 200
     products = client.put(f"/api/applications/{application_id}/products", headers=headers, json=[{
         "product_data": {
-            "category": "小型信息和电信设备", "name": "Charger", "brand_logo": "ACME",
+            "category": "小型IT 家用", "name": "Charger", "brand_logo": "ACME",
             "max_dimension_cm": 20, "estimated_sales": 10000,
         }
     }])
@@ -112,13 +117,7 @@ def test_upload_rules_distinguish_store_screenshot(client):
 
 def test_saved_company_license_is_auto_synced_to_materials(client, monkeypatch):
     headers = login(client)
-    response = client.post(
-        "/api/applications",
-        json={"country": "Germany", "service_type": "Battery"},
-        headers=headers,
-    )
-    assert response.status_code == 201
-    application_id = response.json()["id"]
+    application_id = create_application(client, headers, "de-battery-brand")
 
     saved = client.put(f"/api/applications/{application_id}/company", headers=headers, json={
         "company_name": "测试科技有限公司",

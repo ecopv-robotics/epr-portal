@@ -9,7 +9,8 @@ from app.core.storage import storage
 from app.dependencies import get_current_user
 from app.models import MaterialFile, MaterialRequirement, User
 from app.modules.application.service import ensure_editable, get_owned_application
-from app.schemas import MaterialFileOut, UploadOut
+from app.modules.material.ocr import recognition_token, recognize_document, stored_file
+from app.schemas import DocumentRecognitionOut, DocumentRecognitionRequest, MaterialFileOut, UploadOut
 
 router = APIRouter(tags=["文件与材料"])
 UPLOAD_RULES = {
@@ -42,7 +43,24 @@ def upload_file(
     _: User = Depends(get_current_user),
 ):
     file_url, size = save_checked(file, purpose)
-    return UploadOut(file_url=file_url, original_name=file.filename or "upload", file_size=size)
+    return UploadOut(
+        file_url=file_url,
+        original_name=file.filename or "upload",
+        file_size=size,
+        recognition_token=recognition_token(file_url),
+    )
+
+
+@router.post("/files/recognize", response_model=DocumentRecognitionOut)
+def recognize_uploaded_file(
+    payload: DocumentRecognitionRequest,
+    _: User = Depends(get_current_user),
+):
+    source = stored_file(payload.file_url, payload.recognition_token)
+    fields, warnings = recognize_document(source, payload.document_type)
+    if not fields:
+        warnings = ["未识别到可回填字段，请确认图片清晰、完整且证件类型正确。", *warnings]
+    return DocumentRecognitionOut(document_type=payload.document_type, fields=fields, warnings=warnings)
 
 
 @router.post("/material/upload", response_model=MaterialFileOut)

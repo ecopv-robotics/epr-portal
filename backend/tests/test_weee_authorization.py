@@ -2,6 +2,7 @@ import base64
 from io import BytesIO
 
 from docx import Document
+from tests.helpers import confirm_offline_payment
 
 
 def login(client):
@@ -11,13 +12,14 @@ def login(client):
 
 
 def create_application(client, headers):
-    response = client.post(
-        "/api/applications",
-        json={"country": "Germany", "service_type": "WEEE"},
+    order = client.post(
+        "/api/portal/orders",
+        json={"service_id": "de-weee", "service_year": "2026年（自然年）", "quantity": 1},
         headers=headers,
     )
-    assert response.status_code == 201
-    return response.json()
+    response = confirm_offline_payment(client, headers, order)
+    assert response.status_code == 200
+    return response.json()["service_instances"][0]
 
 
 def test_weee_authorization_reports_missing_fields(client):

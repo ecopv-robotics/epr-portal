@@ -4,7 +4,28 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Application, ApplicationStatus, ApplicationStatusHistory, MaterialRequirement, User
+from app.models import Application, ApplicationAssignment, ApplicationStatus, ApplicationStatusHistory, CountryResponsibility, Employee, MaterialRequirement, Role, User
+
+
+def assign_country_delivery_owner(db: Session, application: Application, assigned_by_id: int | None = None) -> Employee | None:
+    responsibility = db.scalar(select(CountryResponsibility).where(CountryResponsibility.country == application.country))
+    employee_id = responsibility.delivery_employee_id if responsibility else None
+    assignee = db.get(Employee, employee_id) if employee_id else None
+    if not assignee or not assignee.active or assignee.role.code != "DELIVERY":
+        assignee = db.scalar(select(Employee).join(Role).where(
+            Role.code == "DELIVERY", Employee.active.is_(True)
+        ).order_by(Employee.display_name))
+    if not assignee:
+        return None
+    actor_id = assigned_by_id
+    if actor_id is None:
+        actor_id = db.scalar(select(Employee.id).join(Role).where(Role.code == "ADMIN", Employee.active.is_(True))) or assignee.id
+    assignment = application.assignment
+    if assignment:
+        assignment.employee_id, assignment.assigned_by_id = assignee.id, actor_id
+    else:
+        application.assignment = ApplicationAssignment(employee_id=assignee.id, assigned_by_id=actor_id)
+    return assignee
 
 
 def reusable_file_for_requirement(application: Application, requirement: MaterialRequirement) -> tuple[str, str] | None:

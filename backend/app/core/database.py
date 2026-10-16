@@ -31,6 +31,10 @@ def apply_compatible_schema_updates() -> None:
             application_status_exists = connection.scalar(text("SELECT 1 FROM pg_type WHERE typname = 'applicationstatus'"))
             if application_status_exists:
                 connection.execute(text("ALTER TYPE applicationstatus ADD VALUE IF NOT EXISTS 'REGISTERING'"))
+            purchase_status_exists = connection.scalar(text("SELECT 1 FROM pg_type WHERE typname = 'purchaseorderstatus'"))
+            if purchase_status_exists:
+                for value in ("PAYMENT_CONFIRMING", "CANCELLED", "PAYMENT_FAILED", "PARTIALLY_REFUNDED", "REFUNDED"):
+                    connection.execute(text(f"ALTER TYPE purchaseorderstatus ADD VALUE IF NOT EXISTS '{value}'"))
     inspector = inspect(engine)
     if "application" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("application")}
@@ -42,6 +46,7 @@ def apply_compatible_schema_updates() -> None:
             "role": "VARCHAR(20) DEFAULT 'CUSTOMER' NOT NULL",
         },
         "application": {
+            "purchase_order_id": "INTEGER", "instance_index": "INTEGER",
             "reviewed_time": "TIMESTAMP", "review_note": "TEXT",
             "registration_number": "VARCHAR(150)", "certificate_file": "VARCHAR(500)",
             "invoice_file": "VARCHAR(500)", "result_file": "VARCHAR(500)",
@@ -60,6 +65,23 @@ def apply_compatible_schema_updates() -> None:
         "store": {
             "company_name_en": "VARCHAR(255)", "register_city_en": "VARCHAR(150)",
             "postal_code": "VARCHAR(30)", "register_address_en": "VARCHAR(500)",
+        },
+        "purchase_order": {
+            "payment_method": "VARCHAR(30)", "payer_name": "VARCHAR(150)",
+            "payment_proof": "VARCHAR(500)",
+            "batch_no": "VARCHAR(30)", "standard_amount": "INTEGER DEFAULT 0 NOT NULL",
+            "discount_amount": "INTEGER DEFAULT 0 NOT NULL", "discount_reason": "TEXT",
+            "actual_paid_amount": "INTEGER", "finance_receipt": "VARCHAR(500)",
+            "finance_note": "TEXT", "contract_no": "VARCHAR(80)",
+            "contract_file": "VARCHAR(500)", "contract_version": "VARCHAR(30)",
+            "customer_signed_contract_file": "VARCHAR(500)",
+            "signed_contract_uploaded_time": "TIMESTAMP",
+            "product_configurations": "JSON DEFAULT '[]' NOT NULL",
+        },
+        "cart_item": {
+            "service_year": "VARCHAR(50) DEFAULT '' NOT NULL",
+            "package_type": "VARCHAR(100) DEFAULT '' NOT NULL",
+            "product_configurations": "JSON DEFAULT '[]' NOT NULL",
         },
     }
     table_names = set(inspector.get_table_names())
@@ -83,4 +105,17 @@ def apply_compatible_schema_updates() -> None:
                 "UPDATE company SET user_id = (SELECT application.user_id FROM application "
                 "WHERE application.company_id = company.id ORDER BY application.id LIMIT 1) "
                 "WHERE user_id IS NULL"
+            ))
+        if "purchase_order" in table_names and "application" in table_names:
+            connection.execute(text(
+                "UPDATE purchase_order SET standard_amount = total_amount "
+                "WHERE standard_amount IS NULL OR standard_amount = 0"
+            ))
+            connection.execute(text(
+                "UPDATE application SET purchase_order_id = ("
+                "SELECT purchase_order.id FROM purchase_order "
+                "WHERE purchase_order.application_id = application.id LIMIT 1"
+                "), instance_index = COALESCE(instance_index, 1) "
+                "WHERE purchase_order_id IS NULL AND EXISTS ("
+                "SELECT 1 FROM purchase_order WHERE purchase_order.application_id = application.id)"
             ))

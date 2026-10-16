@@ -1,3 +1,6 @@
+from tests.helpers import confirm_offline_payment
+
+
 def login(client):
     response = client.post("/api/auth/login", json={"account": "demo@eprflow.com", "password": "Demo123!"})
     assert response.status_code == 200
@@ -11,10 +14,10 @@ def test_login_rejects_invalid_password(client):
 
 def test_create_and_list_application(client):
     headers = login(client)
-    created = client.post("/api/applications", json={"country": "Germany", "service_type": "WEEE"}, headers=headers)
-    assert created.status_code == 201
-    assert created.json()["status"] == "DRAFT"
-    assert created.json()["application_no"].startswith("EPR")
+    order = client.post("/api/portal/orders", json={"service_id": "de-weee", "service_year": "2026年（自然年）", "quantity": 1}, headers=headers)
+    created = confirm_offline_payment(client, headers, order).json()["service_instances"][0]
+    assert created["status"] == "DRAFT"
+    assert created["application_no"].startswith("EPR")
 
     listed = client.get("/api/applications", headers=headers)
     assert listed.status_code == 200
@@ -31,8 +34,14 @@ def test_catalog_is_available(client):
 
 def test_rejects_unknown_country_service_pair(client):
     response = client.post(
-        "/api/applications",
-        json={"country": "Germany", "service_type": "Unknown"},
+        "/api/portal/orders",
+        json={"service_id": "unknown", "service_year": "2026年（自然年）", "quantity": 1},
         headers=login(client),
     )
-    assert response.status_code == 422
+    assert response.status_code == 404
+
+
+def test_customer_cannot_create_unpaid_service_instance(client):
+    response = client.post("/api/applications", json={"country": "Germany", "service_type": "WEEE"}, headers=login(client))
+    assert response.status_code == 409
+    assert "完成付款" in response.json()["detail"]

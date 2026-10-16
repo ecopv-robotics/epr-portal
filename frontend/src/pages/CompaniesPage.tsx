@@ -11,7 +11,7 @@ import type { Application, ApplicationStatus, Company, CompanyProfile } from '..
 
 const regions: Record<string, string> = { MAINLAND_CHINA: '中国大陆公司', HONG_KONG: '中国香港公司', EU: '欧盟公司', OTHER: '其他公司' }
 const emptyCompany: Company = { company_name: '', registration_region: 'MAINLAND_CHINA' }
-const statusMeta: Record<ApplicationStatus, { label: string; color: string }> = { DRAFT: { label: '草稿', color: 'default' }, SUBMITTED: { label: '已提交', color: 'blue' }, REVIEWING: { label: '审核中', color: 'processing' }, NEED_FIX: { label: '待补资料', color: 'warning' }, REGISTERING: { label: '注册中', color: 'cyan' }, COMPLETED: { label: '已完成', color: 'success' } }
+const statusMeta: Record<ApplicationStatus, { label: string; color: string }> = { DRAFT: { label: '草稿', color: 'default' }, SUBMITTED: { label: '待审核', color: 'blue' }, REVIEWING: { label: '审核中', color: 'processing' }, NEED_FIX: { label: '待补资料', color: 'warning' }, REGISTERING: { label: '注册中', color: 'cyan' }, COMPLETED: { label: '已完成', color: 'success' } }
 
 function FilePreview({ url, title }: { url: string; title: string; trigger?: 'link' }) {
   const origin = new URL(String(api.defaults.baseURL), window.location.origin).origin
@@ -52,7 +52,7 @@ export default function CompaniesPage() {
     { title: '营业执照号 / 企业注册号', dataIndex: 'register_number', render: v => v || '--' },
     { title: '资料完整度', dataIndex: 'completeness', render: v => <Progress percent={v} size="small" style={{ width: 120 }} /> },
     { title: '关联递单', dataIndex: 'application_count', render: (v, r) => <Button type="link" size="small" onClick={() => void openRelated(r)}><Tag color="blue" style={{ cursor: 'pointer', margin: 0 }}>{v} 份</Tag></Button> },
-    { title: '操作', key: 'action', render: (_, r) => <Space size={0}><Button type="link" icon={<EyeOutlined />} onClick={() => setViewing(r)}>查看</Button><Button type="link" icon={<EditOutlined />} onClick={() => openEdit(r)}>编辑</Button><Button type="link" icon={<AppstoreAddOutlined />} onClick={() => navigate(`/application/create?companyId=${r.id}`)}>新建递单</Button></Space> },
+    { title: '操作', key: 'action', render: (_, r) => <Space size={0}><Button type="link" icon={<EyeOutlined />} onClick={() => setViewing(r)}>查看</Button><Button type="link" icon={<EditOutlined />} onClick={() => openEdit(r)}>编辑</Button><Button type="link" icon={<AppstoreAddOutlined />} onClick={() => navigate('/services')}>购买服务</Button></Space> },
   ]
   const legal = viewing?.legal_person
   return <div className="page-container">
@@ -74,7 +74,7 @@ export default function CompaniesPage() {
         { title: '操作', render: (_: unknown, r: Application) => <Button type="link" icon={<EyeOutlined />} onClick={() => navigate(`/application/${r.id}/form`)}>查看递单</Button> },
       ]} />
     </Modal>
-    <Modal title="企业资料详情" width={1000} styles={{ body: { maxHeight: '68vh', overflowY: 'auto', paddingRight: 8 } }} open={Boolean(viewing)} onCancel={() => setViewing(undefined)} footer={<Space><Button onClick={() => setViewing(undefined)}>关闭</Button><Button onClick={() => { const company = viewing; setViewing(undefined); openEdit(company) }}>编辑资料</Button><Button type="primary" onClick={() => navigate(`/application/create?companyId=${viewing?.id}`)}>使用该企业新建递单</Button></Space>}>
+    <Modal title="企业资料详情" width={1000} styles={{ body: { maxHeight: '68vh', overflowY: 'auto', paddingRight: 8 } }} open={Boolean(viewing)} onCancel={() => setViewing(undefined)} footer={<Space><Button onClick={() => setViewing(undefined)}>关闭</Button><Button onClick={() => { const company = viewing; setViewing(undefined); openEdit(company) }}>编辑资料</Button><Button type="primary" onClick={() => navigate('/services')}>购买服务</Button></Space>}>
       <div className="registration-result-section">
         <div className="section-heading"><Typography.Title level={3}>公司信息</Typography.Title></div>
         <Descriptions bordered column={1} labelStyle={{ width: 250 }}>

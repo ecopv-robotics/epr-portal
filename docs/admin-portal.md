@@ -35,9 +35,17 @@ npm install
 npm run dev
 ```
 
-管理员：`admin@eprflow.com / Admin123!`
+系统管理员：`admin@eprflow.com / Demo123!`
 
-审核员工：`staff@eprflow.com / Staff123!`
+销售：`sales@eprflow.com / Demo123!`
+
+财务：`finance@eprflow.com / Demo123!`
+
+商务：`business@eprflow.com / Demo123!`
+
+交付：`delivery@eprflow.com / Demo123!`
+
+商务兼容账号：`staff@eprflow.com / Demo123!`
 
 ## 测试
 

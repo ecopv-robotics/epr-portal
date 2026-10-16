@@ -2,6 +2,7 @@ import os
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_epr_portal.db"
 os.environ["JWT_SECRET"] = "test-secret"
+os.environ["VERIFICATION_DEBUG"] = "false"
 
 import pytest
 from fastapi.testclient import TestClient

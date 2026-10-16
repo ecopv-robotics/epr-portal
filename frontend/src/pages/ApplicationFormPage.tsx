@@ -1,6 +1,6 @@
 import {
   ArrowLeftOutlined, CheckCircleFilled, CloudUploadOutlined, CopyOutlined, DeleteOutlined,
-  DownloadOutlined, EyeOutlined, FileDoneOutlined, FileOutlined, FileTextOutlined, PlusOutlined, ProfileOutlined, SaveOutlined,
+  DownloadOutlined, EyeOutlined, FileDoneOutlined, FileOutlined, FileTextOutlined, PlusOutlined, ProfileOutlined, SaveOutlined, ScanOutlined,
 } from '@ant-design/icons'
 import {
   Alert, Button, Card, Col, Descriptions, Divider, Empty, Form, Input, InputNumber, List, Modal,
@@ -11,8 +11,10 @@ import axios from 'axios'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import api from '../api'
+import { customerProgress } from '../customerProgress'
 import type {
-  ApplicationFormData, ApplicationStatus, Company, DynamicField, LegalPerson, MaterialFile, Product, StatusHistory, Store,
+  ApplicationFormData, ApplicationStatus, Company, DocumentRecognition, DynamicField, LegalPerson, MaterialFile, Product,
+  RecognizableDocumentType, StatusHistory, Store,
 } from '../types'
 
 const stepItems = [
@@ -21,13 +23,13 @@ const stepItems = [
 ]
 
 const STATUS_META: Record<ApplicationStatus, { label: string; color: string }> = {
-  DRAFT: { label: '草稿', color: 'default' }, SUBMITTED: { label: '已提交', color: 'blue' },
+  DRAFT: { label: '草稿', color: 'default' }, SUBMITTED: { label: '待审核', color: 'blue' },
   REVIEWING: { label: '审核中', color: 'processing' }, NEED_FIX: { label: '待补资料', color: 'warning' },
   REGISTERING: { label: '注册中', color: 'cyan' },
   COMPLETED: { label: '已完成', color: 'success' },
 }
 
-type UploadResult = { file_url: string; original_name: string; file_size: number }
+type UploadResult = { file_url: string; original_name: string; file_size: number; recognition_token?: string }
 
 type ChecklistItem = {
   key: string
@@ -130,12 +132,73 @@ async function uploadCommon(file: File, purpose: string): Promise<UploadResult> 
 
 function FileUpload({
   value, onChange, purpose = 'document', accept = '.pdf,.jpg,.jpeg,.png', hint = 'JPG、JPEG、PNG、PDF，最大 20MB', example,
-}: { value?: string; onChange?: (value: string) => void; purpose?: string; accept?: string; hint?: string; example?: { url: string; label: string } }) {
+  recognitionType, onRecognized,
+}: {
+  value?: string
+  onChange?: (value: string) => void
+  purpose?: string
+  accept?: string
+  hint?: string
+  example?: { url: string; label: string }
+  recognitionType?: RecognizableDocumentType
+  onRecognized?: (result: DocumentRecognition) => void
+}) {
+  const [recognizing, setRecognizing] = useState(false)
+  const [recognitionError, setRecognitionError] = useState('')
+
+  function reviewRecognition(result: DocumentRecognition) {
+    if (!result.fields.length) {
+      setRecognitionError(result.warnings.join('；') || '未识别到可回填内容，请使用清晰、完整的证件图片重新上传。')
+      Modal.warning({ title: '未识别到可回填内容', content: result.warnings.join('；') || '请上传清晰、完整的证件图片后重试。' })
+      return
+    }
+    Modal.confirm({
+      title: <Space><ScanOutlined />核对识别结果</Space>,
+      width: 680,
+      okText: '确认回填',
+      cancelText: '暂不回填',
+      content: <div className="ocr-review">
+        <Alert type="info" showIcon message="请对照原件核对，确认后才会写入表单。" />
+        <Descriptions bordered size="small" column={1}>
+          {result.fields.map((field) => <Descriptions.Item key={field.target_field} label={field.label}>
+            <Space><span>{field.value}</span><Tag color={field.confidence >= 0.85 ? 'green' : field.confidence >= 0.65 ? 'orange' : 'red'}>{Math.round(field.confidence * 100)}%</Tag></Space>
+          </Descriptions.Item>)}
+        </Descriptions>
+        {result.warnings.length > 0 && <Alert type="warning" showIcon message="识别提示" description={result.warnings.join('；')} />}
+      </div>,
+      onOk: () => onRecognized?.(result),
+    })
+  }
+
   const props: UploadProps = {
     showUploadList: false,
     accept,
     customRequest: async ({ file, onSuccess, onError }) => {
-      try { const result = await uploadCommon(file as File, purpose); onChange?.(result.file_url); onSuccess?.(result) }
+      setRecognitionError('')
+      try {
+        const uploadedFile = file as File
+        const result = await uploadCommon(uploadedFile, purpose)
+        onChange?.(result.file_url)
+        onSuccess?.(result)
+        if (recognitionType && result.recognition_token && /\.(?:jpe?g|png|webp|pdf)$/i.test(uploadedFile.name)) {
+          setRecognizing(true)
+          try {
+            const response = await api.post<DocumentRecognition>('/files/recognize', {
+              file_url: result.file_url,
+              recognition_token: result.recognition_token,
+              document_type: recognitionType,
+            }, { timeout: 120000 })
+            reviewRecognition(response.data)
+          } catch (error) {
+            const detail = axios.isAxiosError(error) ? error.response?.data?.detail : undefined
+            setRecognitionError(typeof detail === 'string' ? detail : '文件已上传，但识别失败，请重新上传重试。')
+          } finally { setRecognizing(false) }
+        } else if (recognitionType) {
+          setRecognitionError(!result.recognition_token
+            ? '文件已上传，但当前后端尚未启用识别功能。请联系管理员更新后端后重新上传。'
+            : '文件已上传，此格式不支持文字识别。请使用 JPG、PNG、WEBP 或 PDF。')
+        }
+      }
       catch (error) { onError?.(error as Error); message.error(axios.isAxiosError(error) ? error.response?.data?.detail ?? '上传失败' : '上传失败') }
     },
   }
@@ -145,6 +208,8 @@ function FileUpload({
       {value ? <FilePreview url={value} title="已上传文件" /> : example ? <FilePreview url={example.url} title={example.label} /> : null}
     </div>
     <Typography.Text type="secondary">支持 {hint}</Typography.Text>
+    {recognitionType && <div className="ocr-hint"><ScanOutlined /> {recognizing ? '正在识别证件文字…' : '上传清晰图片后将自动识别，并在确认后回填表单'}</div>}
+    {recognitionError && <Alert type="warning" showIcon message="文件上传成功，文字识别未完成" description={recognitionError} />}
   </div>
 }
 
@@ -168,6 +233,7 @@ export default function ApplicationFormPage() {
   const [saving, setSaving] = useState(false)
   const [generatingTranslation, setGeneratingTranslation] = useState(false)
   const [generatingAuthorization, setGeneratingAuthorization] = useState(false)
+  const [countersignUploading, setCountersignUploading] = useState(false)
   const [step, setStep] = useState(0)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [checklistOpen, setChecklistOpen] = useState(false)
@@ -194,6 +260,31 @@ export default function ApplicationFormPage() {
       setStatusHistory(historyResponse.data)
     } catch { message.error('递单资料加载失败'); navigate('/applications') }
     finally { setLoading(false) }
+  }
+
+  const countersignUpload: UploadProps = {
+    showUploadList: false,
+    accept: '.pdf,application/pdf',
+    beforeUpload: file => {
+      if (!file.name.toLowerCase().endsWith('.pdf')) {
+        message.error('二次回签文件必须是 PDF 格式')
+        return Upload.LIST_IGNORE
+      }
+      return true
+    },
+    customRequest: async ({ file, onSuccess, onError }) => {
+      setCountersignUploading(true)
+      try {
+        const uploaded = await uploadCommon(file as File, 'document')
+        await api.put(`/portal/applications/${id}/countersign`, { countersign_file: uploaded.file_url })
+        onSuccess?.(uploaded)
+        message.success('二次回签文件已提交')
+        await load()
+      } catch (error) {
+        onError?.(error as Error)
+        message.error(axios.isAxiosError(error) ? error.response?.data?.detail ?? '二次回签文件提交失败' : '二次回签文件提交失败')
+      } finally { setCountersignUploading(false) }
+    },
   }
   useEffect(() => { void load() }, [id]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -287,6 +378,20 @@ export default function ApplicationFormPage() {
     setHistoryOpen(false); message.success('已填充公司和法人信息，对应证明材料将自动同步')
   }
 
+  function applyCompanyRecognition(result: DocumentRecognition) {
+    const allowed = new Set(['company_name', 'company_type', 'register_number', 'established_date', 'register_address'])
+    const values = Object.fromEntries(result.fields.filter((field) => allowed.has(field.target_field)).map((field) => [field.target_field, field.value])) as Partial<Company>
+    companyForm.setFieldsValue(values)
+    message.success(`已回填 ${Object.keys(values).length} 个公司字段，请核对后保存`)
+  }
+
+  function applyLegalRecognition(result: DocumentRecognition) {
+    const allowed = new Set(['name_cn', 'name_en', 'certificate_number', 'gender'])
+    const values = Object.fromEntries(result.fields.filter((field) => allowed.has(field.target_field)).map((field) => [field.target_field, field.value])) as Partial<LegalPerson>
+    legalForm.setFieldsValue(values)
+    message.success(`已回填 ${Object.keys(values).length} 个法人字段，请核对后保存`)
+  }
+
   async function saveCurrent(next = false) {
     setSaving(true)
     try {
@@ -319,6 +424,15 @@ export default function ApplicationFormPage() {
       else if (axios.isAxiosError(error)) message.error(error.response?.data?.detail ?? '保存失败')
       return false
     } finally { setSaving(false) }
+  }
+
+  async function changeStep(nextStep: number) {
+    if (nextStep === step || saving) return
+    if (!editable || nextStep < step || step === 5) {
+      setStep(nextStep)
+      return
+    }
+    if (await saveCurrent(false)) setStep(nextStep)
   }
 
   function updateProduct(index: number, field: string, value: string | number | null) {
@@ -403,6 +517,13 @@ export default function ApplicationFormPage() {
   if (!data) return null
 
   const completion = Math.round((step / 5) * 100)
+  const progress = customerProgress(data.application)
+  const deliveryProgress = <Card className="delivery-progress-card" title="服务办理进度" extra={<Tag color={progress.color}>{progress.label}</Tag>}>
+    <Steps current={progress.current} status={progress.rejected ? 'error' : 'process'} items={progress.items} responsive />
+    <Typography.Paragraph className="customer-progress-description" type="secondary">{progress.description}</Typography.Paragraph>
+    {progress.rejected && <Alert className="delivery-countersign-alert" type="error" showIcon message="审核意见" description={data.application.review_note || '请补充或修正资料后重新提交。'} />}
+    {data.application.countersign_required && <Alert className="delivery-countersign-alert" type="warning" showIcon message="待你完成二次回签" description={<Space direction="vertical" size={10}><span>{data.application.countersign_note || '请上传 PDF 格式的二次回签文件。'}</span><Upload {...countersignUpload}><Button type="primary" icon={<CloudUploadOutlined />} loading={countersignUploading}>上传二次回签 PDF</Button></Upload></Space>} />}
+  </Card>
   if (data.application.status === 'REGISTERING' || data.application.status === 'COMPLETED') {
     const legal = data.company?.legal_person
     const file = (url: string | undefined, title: string) => url ? <FilePreview url={url} title={title} /> : '--'
@@ -469,8 +590,9 @@ export default function ApplicationFormPage() {
       </Descriptions>
     </div>
     return <div className="application-form-page">
-      <div className="form-topbar"><Button type="text" icon={<ArrowLeftOutlined />} onClick={() => navigate('/applications')}>返回我的递单</Button><div className="form-topbar-summary"><strong>{data.application.application_no}</strong><Tag className="service-tag" color="blue">{data.application.country} · {data.application.service_type}</Tag><Tag color={STATUS_META[data.application.status].color}>{STATUS_META[data.application.status].label}</Tag></div></div>
-      <Card className="completed-workspace"><Alert className="status-alert" showIcon type={data.application.status === 'COMPLETED' ? 'success' : 'info'} message={data.application.status === 'COMPLETED' ? '注册服务已完成' : '资料审核已通过，正在执行注册'} description={data.application.status === 'COMPLETED' ? `注册号：${data.application.registration_number || '--'}` : '等待官方下证，注册信息将由工作人员录入并同步至此。'} /><Tabs defaultActiveKey="materials" items={[{ key: 'materials', label: '注册资料', children: registrationMaterials }, { key: 'registration', label: '注册信息', children: registrationInfo }]} /></Card>
+      <div className="form-topbar"><Button type="text" icon={<ArrowLeftOutlined />} onClick={() => navigate('/applications')}>返回我的递单</Button><div className="form-topbar-summary"><strong>{data.application.application_no}</strong><Tag className="service-tag" color="blue">{data.application.country} · {data.application.service_type}</Tag><Tag color={progress.color}>{progress.label}</Tag></div></div>
+      {deliveryProgress}
+      <Card className="completed-workspace"><Tabs defaultActiveKey="materials" items={[{ key: 'materials', label: '注册资料', children: registrationMaterials }, { key: 'registration', label: '注册信息', children: registrationInfo }]} /></Card>
     </div>
   }
   return <div className="application-form-page">
@@ -480,15 +602,16 @@ export default function ApplicationFormPage() {
         <strong>{data.application.application_no}</strong>
         <Tag className="service-tag" color="blue">{data.application.country} · {data.application.service_type}</Tag>
         <Button className="checklist-button" type="link" icon={<ProfileOutlined />} onClick={() => setChecklistOpen(true)}>资料清单</Button>
-        <Tag color={STATUS_META[data.application.status].color}>{STATUS_META[data.application.status].label}</Tag>
+        <Tag color={progress.color}>{progress.label}</Tag>
       </div>
     </div>
+    {deliveryProgress}
     <Card className="form-workspace">
       <aside className="form-sidebar">
         <Typography.Title level={4}>资料填写</Typography.Title>
         <Typography.Text type="secondary">模板版本 v{data.template.version}</Typography.Text>
         <Progress percent={completion} size="small" showInfo={false} />
-        <Steps direction="vertical" current={step} onChange={setStep} items={stepItems} />
+        <Steps direction="vertical" current={step} onChange={(value) => void changeStep(value)} items={stepItems} />
       </aside>
       <section className="form-main">
         {!editable && <Alert className="status-alert" showIcon type="info" message={`当前状态：${STATUS_META[data.application.status].label}`} description="资料已锁定，可查看但不能修改。" />}
@@ -512,7 +635,7 @@ export default function ApplicationFormPage() {
             </Row>
             <Divider orientation="left">公司证明文件</Divider>
             {registrationRegion === 'MAINLAND_CHINA' && <Row gutter={20}>
-              <Col xs={24} md={12}><Form.Item name="license_file" label="公司营业执照" rules={[{ required: true, message: '请上传公司营业执照' }]}><FileUpload example={EXAMPLE_FILES.license} /></Form.Item></Col>
+              <Col xs={24} md={12}><Form.Item name="license_file" label="公司营业执照" rules={[{ required: true, message: '请上传公司营业执照' }]}><FileUpload example={EXAMPLE_FILES.license} recognitionType="business_license" onRecognized={applyCompanyRecognition} /></Form.Item></Col>
               <Col xs={24} md={12}><Form.Item name="license_translation_file" label="营业执照翻译件（选填）" extra={<Button type="link" loading={generatingTranslation} disabled={!editable || !companyForm.getFieldValue('license_file')} onClick={() => void generateLicenseTranslation()}>一键生成英文翻译件</Button>}><FileUpload /></Form.Item></Col>
               <Col xs={24} md={12}><Form.Item name="credit_report_file" label="企业信用报告" rules={[{ required: true, message: '请上传企业信用报告' }]}><FileUpload example={EXAMPLE_FILES.creditReport} /></Form.Item></Col>
             </Row>}
@@ -543,7 +666,7 @@ export default function ApplicationFormPage() {
             </Row>
             <Divider orientation="left">证件与签名</Divider>
             <Row gutter={20}>
-              <Col xs={24} md={12}><Form.Item name="front_file" label={certificateType === 'PASSPORT' ? '护照资料页' : '法人身份证－人像面'} rules={[{ required: true, message: '请上传证件资料' }]}><FileUpload purpose="identity" accept=".pdf,.jpg,.jpeg,.png,.webp,.doc,.docx" hint="PDF、JPG、JPEG、PNG、WEBP、DOC、DOCX，最大 20MB" example={certificateType === 'ID_CARD' ? EXAMPLE_FILES.identityFront : undefined} /></Form.Item></Col>
+              <Col xs={24} md={12}><Form.Item name="front_file" label={certificateType === 'PASSPORT' ? '护照资料页' : '法人身份证－人像面'} rules={[{ required: true, message: '请上传证件资料' }]}><FileUpload purpose="identity" accept=".pdf,.jpg,.jpeg,.png,.webp,.doc,.docx" hint="PDF、JPG、JPEG、PNG、WEBP、DOC、DOCX，最大 20MB" example={certificateType === 'ID_CARD' ? EXAMPLE_FILES.identityFront : undefined} recognitionType={certificateType === 'PASSPORT' ? 'passport' : 'id_card_front'} onRecognized={applyLegalRecognition} /></Form.Item></Col>
               {certificateType === 'ID_CARD' && <Col xs={24} md={12}><Form.Item name="back_file" label="法人身份证－国徽面" rules={[{ required: true, message: '请上传身份证国徽面' }]}><FileUpload purpose="identity" accept=".jpg,.jpeg,.png,.webp" hint="JPG、JPEG、PNG、WEBP，最大 20MB" example={EXAMPLE_FILES.identityBack} /></Form.Item></Col>}
               <Col xs={24} md={12}><Form.Item name="signature_file" label="法人代表签名（拼音）" rules={[{ required: true, message: '请上传法人签名' }]}><FileUpload purpose="signature" accept=".jpg,.jpeg,.png,.webp" hint="JPG、JPEG、PNG、WEBP，最大 20MB" example={EXAMPLE_FILES.signature} /></Form.Item></Col>
             </Row>
@@ -647,13 +770,43 @@ function DynamicFieldControl({ field, value, onChange, disabled }: { field: Dyna
 }
 
 function Confirmation({ data, products, materials, statusHistory }: { data: ApplicationFormData; products: Record<string, string | number | undefined>[]; materials: ChecklistItem[]; statusHistory: StatusHistory[] }) {
+  const company = data.company
+  const legal = company?.legal_person
+  const value = (content: string | number | undefined) => content === undefined || content === '' ? '未填写' : content
+  const optionLabel = (content: string | undefined, options: { value: string; label: string }[]) => options.find((item) => item.value === content)?.label || value(content)
+  const certificateOptions = [{ value: 'ID_CARD', label: '身份证' }, { value: 'PASSPORT', label: '护照' }]
+  const genderOptions = [{ value: 'MALE', label: '男' }, { value: 'FEMALE', label: '女' }, { value: 'OTHER', label: '其他' }]
   return <>
     <div className="section-heading"><div><Typography.Title level={3}>确认提交</Typography.Title><Typography.Text type="secondary">请核对所有资料，提交后将进入审核流程。</Typography.Text></div></div>
     <Descriptions bordered column={2} title="申请信息"><Descriptions.Item label="申请编号">{data.application.application_no}</Descriptions.Item><Descriptions.Item label="国家 / 服务">{data.application.country} / {data.application.service_type}</Descriptions.Item></Descriptions>
     <Divider />
-    <Descriptions bordered column={2} title="公司与法人"><Descriptions.Item label="公司名称">{data.company?.company_name || '未填写'}</Descriptions.Item><Descriptions.Item label="注册地类型">{COMPANY_REGION_OPTIONS.find((item) => item.value === data.company?.registration_region)?.label || '未填写'}</Descriptions.Item><Descriptions.Item label="注册号">{data.company?.register_number || '未填写'}</Descriptions.Item><Descriptions.Item label="法人姓名">{data.company?.legal_person?.name_cn || '未填写'}</Descriptions.Item><Descriptions.Item label="联系人邮箱">{data.company?.legal_person?.contact_email || '未填写'}</Descriptions.Item><Descriptions.Item label="联系人电话">{data.company?.legal_person?.contact_phone || '未填写'}</Descriptions.Item></Descriptions>
+    <Descriptions bordered column={2} title="公司信息">
+      <Descriptions.Item label="公司注册地">{optionLabel(company?.registration_region, COMPANY_REGION_OPTIONS)}</Descriptions.Item>
+      <Descriptions.Item label="公司类型">{value(company?.company_type)}</Descriptions.Item>
+      <Descriptions.Item label="公司中文名称">{value(company?.company_name)}</Descriptions.Item>
+      <Descriptions.Item label="营业执照号 / 注册号">{value(company?.register_number)}</Descriptions.Item>
+      {(company?.registration_region === 'EU' || company?.registration_region === 'OTHER') && <Descriptions.Item label="本国 VAT 税号">{value(company.vat_number)}</Descriptions.Item>}
+      <Descriptions.Item label="公司成立日期">{value(company?.established_date)}</Descriptions.Item>
+      <Descriptions.Item label="公司 / 个体经营注册地址" span={2}>{value(company?.register_address)}</Descriptions.Item>
+    </Descriptions>
     <Divider />
-    <Descriptions bordered column={2} title="店铺信息"><Descriptions.Item label="平台">{data.store?.platform || '未填写'}</Descriptions.Item><Descriptions.Item label="店铺链接">{data.store?.store_url || '未填写'}</Descriptions.Item><Descriptions.Item label="英文公司名">{data.store?.company_name_en || '未填写'}</Descriptions.Item><Descriptions.Item label="注册城市">{data.store?.register_city_en || '未填写'}</Descriptions.Item></Descriptions>
+    <Descriptions bordered column={2} title="法人信息">
+      <Descriptions.Item label="法人证件类型">{optionLabel(legal?.certificate_type, certificateOptions)}</Descriptions.Item>
+      <Descriptions.Item label="性别">{optionLabel(legal?.gender, genderOptions)}</Descriptions.Item>
+      <Descriptions.Item label="法人代表中文名">{value(legal?.name_cn)}</Descriptions.Item>
+      <Descriptions.Item label="法人代表拼音名">{value(legal?.name_en)}</Descriptions.Item>
+      <Descriptions.Item label="公司联系人邮箱">{value(legal?.contact_email)}</Descriptions.Item>
+      <Descriptions.Item label="公司联系人电话">{value(legal?.contact_phone)}</Descriptions.Item>
+    </Descriptions>
+    <Divider />
+    <Descriptions bordered column={2} title="店铺信息">
+      <Descriptions.Item label="销售平台">{value(data.store?.platform)}</Descriptions.Item>
+      <Descriptions.Item label="店铺链接">{value(data.store?.store_url)}</Descriptions.Item>
+      <Descriptions.Item label="公司名称（英文）">{value(data.store?.company_name_en)}</Descriptions.Item>
+      <Descriptions.Item label="注册城市（英文）">{value(data.store?.register_city_en)}</Descriptions.Item>
+      <Descriptions.Item label="公司注册地邮编">{value(data.store?.postal_code)}</Descriptions.Item>
+      <Descriptions.Item label="注册地址（英文）" span={2}>{value(data.store?.register_address_en)}</Descriptions.Item>
+    </Descriptions>
     <Divider />
     <div className="confirmation-section-title"><Typography.Title level={5}>产品信息</Typography.Title><Tag color="blue">共 {products.length} 项</Tag></div>
     {products.length ? products.map((product, index) => <Descriptions className="confirmation-product" key={index} bordered size="small" column={2} title={`产品 ${index + 1}`}>

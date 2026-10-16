@@ -27,6 +27,16 @@ class CustomerType(str, enum.Enum):
     DIRECT = "DIRECT"
 
 
+class PurchaseOrderStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    PAYMENT_CONFIRMING = "PAYMENT_CONFIRMING"
+    PAID = "PAID"
+    CANCELLED = "CANCELLED"
+    PAYMENT_FAILED = "PAYMENT_FAILED"
+    PARTIALLY_REFUNDED = "PARTIALLY_REFUNDED"
+    REFUNDED = "REFUNDED"
+
+
 class User(Base):
     __tablename__ = "user"
 
@@ -39,6 +49,20 @@ class User(Base):
     created_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     applications: Mapped[list["Application"]] = relationship(back_populates="user")
     customer_profile: Mapped["CustomerProfile | None"] = relationship(back_populates="user", uselist=False, cascade="all, delete-orphan")
+
+
+class VerificationCode(Base):
+    __tablename__ = "verification_code"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target: Mapped[str] = mapped_column(String(255), index=True)
+    channel: Mapped[str] = mapped_column(String(10), index=True)
+    purpose: Mapped[str] = mapped_column(String(30), default="REGISTER", index=True)
+    code_hash: Mapped[str] = mapped_column(String(64))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
 class CustomerProfile(Base):
@@ -79,6 +103,17 @@ class Employee(Base):
     role: Mapped[Role] = relationship(back_populates="employees")
 
 
+class CountryResponsibility(Base):
+    __tablename__ = "country_responsibility"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    country: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    delivery_employee_id: Mapped[int] = mapped_column(ForeignKey("employee.id"), index=True)
+    created_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    delivery_employee: Mapped[Employee] = relationship(foreign_keys=[delivery_employee_id])
+
+
 class Company(Base):
     __tablename__ = "company"
 
@@ -105,12 +140,15 @@ class Company(Base):
 
 class Application(Base):
     __tablename__ = "application"
+    __table_args__ = (UniqueConstraint("purchase_order_id", "instance_index", name="uq_order_service_instance"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     application_no: Mapped[str] = mapped_column(String(30), unique=True, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("user.id"), index=True)
     company_id: Mapped[int | None] = mapped_column(ForeignKey("company.id"), nullable=True, index=True)
     template_id: Mapped[int | None] = mapped_column(ForeignKey("service_template.id"), nullable=True, index=True)
+    purchase_order_id: Mapped[int | None] = mapped_column(ForeignKey("purchase_order.id"), nullable=True, index=True)
+    instance_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     country: Mapped[str] = mapped_column(String(100))
     service_type: Mapped[str] = mapped_column(String(100))
     status: Mapped[ApplicationStatus] = mapped_column(Enum(ApplicationStatus), default=ApplicationStatus.DRAFT)
@@ -130,6 +168,11 @@ class Application(Base):
     products: Mapped[list["Product"]] = relationship(back_populates="application", cascade="all, delete-orphan")
     material_files: Mapped[list["MaterialFile"]] = relationship(back_populates="application", cascade="all, delete-orphan")
     status_history: Mapped[list["ApplicationStatusHistory"]] = relationship(back_populates="application", cascade="all, delete-orphan")
+    assignment: Mapped["ApplicationAssignment | None"] = relationship(back_populates="application", uselist=False)
+    delivery_task: Mapped["DeliveryTask | None"] = relationship(back_populates="application", uselist=False, cascade="all, delete-orphan")
+    purchase_order: Mapped["PurchaseOrder | None"] = relationship(
+        back_populates="applications", foreign_keys=[purchase_order_id]
+    )
 
 
 class ServiceTemplate(Base):
@@ -258,9 +301,31 @@ class ApplicationAssignment(Base):
     employee_id: Mapped[int] = mapped_column(ForeignKey("employee.id"), index=True)
     assigned_by_id: Mapped[int] = mapped_column(ForeignKey("employee.id"), index=True)
     assigned_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    application: Mapped[Application] = relationship()
+    application: Mapped[Application] = relationship(back_populates="assignment")
     employee: Mapped[Employee] = relationship(foreign_keys=[employee_id])
     assigned_by: Mapped[Employee] = relationship(foreign_keys=[assigned_by_id])
+
+
+class DeliveryTask(Base):
+    __tablename__ = "delivery_task"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    application_id: Mapped[int] = mapped_column(ForeignKey("application.id"), unique=True, index=True)
+    stage: Mapped[str] = mapped_column(String(40), default="RECEIVED", index=True)
+    service_provider: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    provider_reference: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    provider_submission_file: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    provider_submitted_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    supplement_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    supplement_file: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    countersign_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    countersign_file: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    delivery_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_by_id: Mapped[int | None] = mapped_column(ForeignKey("employee.id"), nullable=True, index=True)
+    created_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    application: Mapped[Application] = relationship(back_populates="delivery_task")
+    updated_by: Mapped[Employee | None] = relationship()
 
 
 class AuditRecord(Base):
@@ -274,3 +339,61 @@ class AuditRecord(Base):
     created_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     application: Mapped[Application | None] = relationship()
     employee: Mapped[Employee] = relationship()
+
+
+class CartItem(Base):
+    __tablename__ = "cart_item"
+    __table_args__ = (UniqueConstraint("user_id", "service_id", name="uq_cart_user_service"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("user.id"), index=True)
+    service_id: Mapped[str] = mapped_column(String(80), index=True)
+    service_year: Mapped[str] = mapped_column(String(50), default="")
+    package_type: Mapped[str] = mapped_column(String(100), default="")
+    product_configurations: Mapped[list] = mapped_column(JSON, default=list)
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    created_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    user: Mapped[User] = relationship()
+
+
+class PurchaseOrder(Base):
+    __tablename__ = "purchase_order"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_no: Mapped[str] = mapped_column(String(30), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("user.id"), index=True)
+    service_id: Mapped[str] = mapped_column(String(80), index=True)
+    batch_no: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    service_year: Mapped[str] = mapped_column(String(50))
+    # Legacy columns retained for compatibility. Service information is completed
+    # independently on each paid service instance, not during checkout.
+    subject_type: Mapped[str] = mapped_column(String(100), default="")
+    package_type: Mapped[str] = mapped_column(String(100), default="")
+    product_configurations: Mapped[list] = mapped_column(JSON, default=list)
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    unit_price: Mapped[int] = mapped_column(Integer)
+    standard_amount: Mapped[int] = mapped_column(Integer, default=0)
+    discount_amount: Mapped[int] = mapped_column(Integer, default=0)
+    discount_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    total_amount: Mapped[int] = mapped_column(Integer)
+    status: Mapped[PurchaseOrderStatus] = mapped_column(Enum(PurchaseOrderStatus), default=PurchaseOrderStatus.PENDING, index=True)
+    payment_method: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    payer_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    payment_proof: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    actual_paid_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finance_receipt: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    finance_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    contract_no: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    contract_file: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    contract_version: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    customer_signed_contract_file: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    signed_contract_uploaded_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    application_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    created_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    paid_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    user: Mapped[User] = relationship()
+    applications: Mapped[list[Application]] = relationship(
+        back_populates="purchase_order",
+        foreign_keys=[Application.purchase_order_id],
+        order_by=Application.instance_index,
+    )

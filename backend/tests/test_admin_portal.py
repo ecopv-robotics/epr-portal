@@ -1,5 +1,6 @@
 from app.core.database import SessionLocal
 from app.models import Application, ApplicationStatus
+from tests.helpers import confirm_offline_payment
 
 
 def login(client, account, password):
@@ -8,32 +9,58 @@ def login(client, account, password):
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
+def create_paid_application(client, headers):
+    order = client.post("/api/portal/orders", headers=headers, json={
+        "service_id": "de-weee", "service_year": "2026年（自然年）", "quantity": 1,
+    })
+    paid = confirm_offline_payment(client, headers, order)
+    return paid.json()["service_instances"][0]
+
+
 def test_admin_dashboard_assignment_and_template_configuration(client):
-    admin = login(client, "admin@eprflow.com", "Admin123!")
-    staff = login(client, "staff@eprflow.com", "Staff123!")
+    admin = login(client, "admin@eprflow.com", "Demo123!")
+    business = login(client, "business@eprflow.com", "Demo123!")
     customer = login(client, "demo@eprflow.com", "Demo123!")
 
     dashboard = client.get("/api/admin/dashboard", headers=admin)
     assert dashboard.status_code == 200
-    assert set(dashboard.json()) == {"total", "submitted", "reviewing", "need_fix", "completed", "my_tasks"}
+    assert set(dashboard.json()) == {
+        "total", "submitted", "reviewing", "need_fix", "completed", "my_tasks",
+        "role_code", "delivery_stage_counts", "delivery_tasks",
+    }
+    assert dashboard.json()["role_code"] == "ADMIN"
     assert client.get("/api/admin/dashboard", headers=customer).status_code == 403
 
     employees = client.get("/api/admin/employees", headers=admin)
     assert employees.status_code == 200
-    staff_employee = next(item for item in employees.json() if item["username"] == "staff")
-    assert client.get("/api/admin/employees", headers=staff).status_code == 403
+    staff_employee = next(item for item in employees.json() if item["username"] == "business")
+    assert client.get("/api/admin/employees", headers=business).status_code == 403
+    by_role = {
+        role: [item for item in employees.json() if item["role"]["code"] == role]
+        for role in ("SALES", "BUSINESS", "DELIVERY")
+    }
+    assert {role: len(items) for role, items in by_role.items()} == {
+        "SALES": 5, "BUSINESS": 5, "DELIVERY": 5,
+    }
+    responsibilities = client.get("/api/admin/country-responsibilities", headers=admin)
+    assert responsibilities.status_code == 200
+    assert len(responsibilities.json()) == 50
+    delivery_ids = {item["id"] for item in by_role["DELIVERY"]}
+    assert {item["delivery_employee_id"] for item in responsibilities.json()} == delivery_ids
 
-    created = client.post("/api/applications", headers=customer, json={"country": "Germany", "service_type": "WEEE"})
-    application_id = created.json()["id"]
+    created = create_paid_application(client, customer)
+    application_id = created["id"]
     review_list = client.get("/api/admin/applications", headers=admin)
     assert review_list.status_code == 200
-    assert review_list.json()["total"] == 0
-    assert client.get(f"/api/admin/applications/{application_id}", headers=admin).status_code == 404
-    assert client.put(f"/api/admin/applications/{application_id}/assignment", headers=admin, json={"employee_id": staff_employee["id"]}).status_code == 404
+    assert review_list.json()["total"] == 1
+    assert review_list.json()["items"][0]["status"] == "DRAFT"
+    assert client.get(f"/api/admin/applications/{application_id}", headers=admin).status_code == 200
+    assert client.put(f"/api/admin/applications/{application_id}/assignment", headers=admin, json={"employee_id": staff_employee["id"]}).status_code == 200
+    assert client.patch(f"/api/admin/applications/{application_id}/status", headers=admin, json={"status": "REVIEWING"}).status_code == 409
 
     templates = client.get("/api/admin/templates", headers=admin)
     assert templates.status_code == 200
-    assert client.get("/api/admin/templates", headers=staff).status_code == 403
+    assert client.get("/api/admin/templates", headers=business).status_code == 403
     template = templates.json()[0]
     updated = client.put(f"/api/admin/templates/{template['id']}", headers=admin, json={
         "fields": template["fields"], "materials": template["materials"],
@@ -43,7 +70,7 @@ def test_admin_dashboard_assignment_and_template_configuration(client):
 
 
 def test_agent_account_and_review_list_agent_name(client):
-    admin = login(client, "admin@eprflow.com", "Admin123!")
+    admin = login(client, "admin@eprflow.com", "Demo123!")
     created_agent = client.post("/api/admin/agents", headers=admin, json={
         "username": "partner-one", "email": "partner@example.com", "password": "Partner123!",
         "name": "华南代理", "contact_name": "张经理", "contact_phone": "13900000000",
@@ -51,13 +78,21 @@ def test_agent_account_and_review_list_agent_name(client):
     assert created_agent.status_code == 201
     assert created_agent.json()["customer_type"] == "AGENT"
 
-    agent = login(client, "partner@example.com", "Partner123!")
-    application = client.post("/api/applications", headers=agent, json={"country": "Germany", "service_type": "WEEE"})
-    assert application.status_code == 201
-    assert application.json()["agent_name"] == "华南代理"
+    updated_agent = client.put(f"/api/admin/agents/{created_agent.json()['id']}", headers=admin, json={
+        "name": "华南代理", "email": "partner-updated@example.com",
+        "contact_name": "张经理", "contact_phone": "13900000000", "active": True,
+    })
+    assert updated_agent.status_code == 200
+    assert updated_agent.json()["email"] == "partner-updated@example.com"
+
+    agent = login(client, "partner-updated@example.com", "Partner123!")
+    application = create_paid_application(client, agent)
+    details = client.get(f"/api/applications/{application['id']}", headers=agent)
+    assert details.status_code == 200
+    assert details.json()["agent_name"] == "华南代理"
 
     with SessionLocal() as db:
-        item = db.get(Application, application.json()["id"])
+        item = db.get(Application, application["id"])
         item.status = ApplicationStatus.SUBMITTED
         db.commit()
 

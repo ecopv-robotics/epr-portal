@@ -1,13 +1,30 @@
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-from app.models import ApplicationStatus, CustomerType, UserRole
+from app.models import ApplicationStatus, CustomerType, PurchaseOrderStatus, UserRole
 
 
 class LoginRequest(BaseModel):
     account: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=6, max_length=128)
+
+
+class VerificationCodeRequest(BaseModel):
+    account: str = Field(min_length=5, max_length=255)
+
+
+class VerificationCodeResponse(BaseModel):
+    message: str
+    retry_after: int
+    debug_code: str | None = None
+
+
+class RegisterRequest(BaseModel):
+    account: str = Field(min_length=5, max_length=255)
+    verification_code: str = Field(pattern=r"^\d{6}$")
+    password: str = Field(min_length=8, max_length=128)
 
 
 class UserOut(BaseModel):
@@ -35,6 +52,8 @@ class ApplicationOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
     application_no: str
+    purchase_order_id: int | None = None
+    instance_index: int | None = None
     company_name: str | None = None
     registration_number: str | None = None
     certificate_file: str | None = None
@@ -49,6 +68,10 @@ class ApplicationOut(BaseModel):
     submitted_time: datetime | None
     reviewed_time: datetime | None = None
     review_note: str | None = None
+    delivery_stage: str | None = None
+    countersign_note: str | None = None
+    countersign_file: str | None = None
+    countersign_required: bool = False
 
 
 class ApplicationList(BaseModel):
@@ -175,6 +198,26 @@ class UploadOut(BaseModel):
     file_url: str
     original_name: str
     file_size: int
+    recognition_token: str | None = None
+
+
+class DocumentRecognitionRequest(BaseModel):
+    file_url: str = Field(min_length=8, max_length=500)
+    recognition_token: str = Field(min_length=64, max_length=64)
+    document_type: Literal["business_license", "id_card_front", "passport"]
+
+
+class RecognizedField(BaseModel):
+    target_field: str
+    label: str
+    value: str
+    confidence: float = Field(ge=0, le=1)
+
+
+class DocumentRecognitionOut(BaseModel):
+    document_type: str
+    fields: list[RecognizedField]
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ApplicationFormOut(BaseModel):
@@ -184,6 +227,36 @@ class ApplicationFormOut(BaseModel):
     store: StoreData | None
     products: list[ProductData]
     material_files: list[MaterialFileOut]
+    delivery: "DeliveryTaskOut | None" = None
+
+
+class DeliveryTaskOut(BaseModel):
+    id: int | None = None
+    application_id: int
+    stage: str
+    service_provider: str | None = None
+    provider_reference: str | None = None
+    provider_submission_file: str | None = None
+    provider_submitted_time: datetime | None = None
+    supplement_note: str | None = None
+    supplement_file: str | None = None
+    countersign_note: str | None = None
+    countersign_file: str | None = None
+    delivery_note: str | None = None
+    updated_by_name: str | None = None
+    updated_time: datetime | None = None
+
+
+class DeliveryTaskUpdate(BaseModel):
+    stage: str = Field(pattern="^(RECEIVED|PROVIDER_SUBMITTED|SUPPLEMENT_FOLLOW_UP|COUNTERSIGN_PENDING|COUNTERSIGNED)$")
+    service_provider: str | None = Field(default=None, max_length=200)
+    provider_reference: str | None = Field(default=None, max_length=150)
+    provider_submission_file: str | None = Field(default=None, max_length=500)
+    supplement_note: str | None = Field(default=None, max_length=2000)
+    supplement_file: str | None = Field(default=None, max_length=500)
+    countersign_note: str | None = Field(default=None, max_length=2000)
+    countersign_file: str | None = Field(default=None, max_length=500)
+    delivery_note: str | None = Field(default=None, max_length=2000)
 
 
 class StatusHistoryOut(BaseModel):
@@ -212,6 +285,19 @@ class DashboardOut(BaseModel):
     need_fix: int
     completed: int
     my_tasks: int
+    role_code: str
+    delivery_stage_counts: dict[str, int] = Field(default_factory=dict)
+    delivery_tasks: list["DeliveryDashboardTaskOut"] = Field(default_factory=list)
+
+
+class DeliveryDashboardTaskOut(BaseModel):
+    application_id: int
+    application_no: str
+    company_name: str | None = None
+    country: str
+    service_type: str
+    stage: str
+    updated_time: datetime
 
 
 class RoleOut(BaseModel):
@@ -229,6 +315,17 @@ class EmployeeOut(BaseModel):
     display_name: str
     active: bool
     role: RoleOut
+
+
+class CountryResponsibilityOut(BaseModel):
+    id: int
+    country: str
+    delivery_employee_id: int
+    delivery_employee_name: str
+
+
+class CountryResponsibilityUpdate(BaseModel):
+    delivery_employee_id: int
 
 
 class AssignmentUpdate(BaseModel):
@@ -291,6 +388,7 @@ class CustomerAccountCreate(BaseModel):
 
 class CustomerAccountUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=150)
+    email: EmailStr
     contact_name: str | None = Field(default=None, max_length=100)
     contact_phone: str | None = Field(default=None, max_length=30)
     active: bool = True
@@ -315,3 +413,221 @@ class CustomerAccountDetailOut(BaseModel):
     account: CustomerAccountOut
     applications: list[ApplicationOut]
     companies: list[CompanyProfileOut]
+
+
+class CatalogServiceOut(BaseModel):
+    id: str
+    country: str
+    country_code: str
+    product_type: str
+    service_type: str
+    title: str
+    description: str
+    price: int
+    additional_category_price: int = 0
+    additional_brand_price: int = 0
+    unit: str
+    color: str
+    reporting_frequency: str
+    service_years: list[str]
+    subject_types: list[str]
+    package_types: list[str]
+    product_categories: list[str]
+    purchase_notes: list[str]
+
+
+class DashboardTodoOut(BaseModel):
+    id: str
+    type: str
+    company: str
+    country: str
+    service: str
+    service_no: str
+    created_time: datetime
+    application_id: int | None = None
+    order_id: int | None = None
+
+
+class PortalDashboardOut(BaseModel):
+    pending_materials: int
+    pending_renewals: int
+    pending_countersigns: int = 0
+    unread_messages: int
+    todos: list[DashboardTodoOut]
+
+
+class PortalMessageOut(BaseModel):
+    id: str
+    title: str
+    description: str
+    message_type: str
+    created_time: datetime
+    read: bool = False
+    application_id: int | None = None
+
+
+class ManagerOut(BaseModel):
+    name: str
+    role: str
+    phone: str
+    wechat: str
+    work_hours: str
+    online: bool
+
+
+class ProductCategorySelection(BaseModel):
+    category: str = Field(min_length=1, max_length=100)
+    brands: list[str] = Field(min_length=1, max_length=50)
+
+
+class CartItemCreate(BaseModel):
+    service_id: str = Field(min_length=1, max_length=80)
+    service_year: str = Field(default="", max_length=50)
+    package_type: str = Field(default="", max_length=100)
+    product_configurations: list[ProductCategorySelection] = Field(default_factory=list, max_length=50)
+    quantity: int = Field(default=1, ge=1, le=99)
+
+
+class CartItemOut(BaseModel):
+    id: int
+    service: CatalogServiceOut
+    service_year: str = ""
+    package_type: str = ""
+    product_configurations: list[ProductCategorySelection] = Field(default_factory=list)
+    quantity: int
+    created_time: datetime
+
+
+class PurchaseOrderCreate(BaseModel):
+    service_id: str = Field(min_length=1, max_length=80)
+    service_year: str = Field(min_length=1, max_length=50)
+    package_type: str = Field(default="", max_length=100)
+    product_configurations: list[ProductCategorySelection] = Field(default_factory=list, max_length=50)
+    quantity: int = Field(ge=1, le=99)
+
+
+class CartCheckoutItem(BaseModel):
+    cart_item_id: int
+    service_year: str = Field(min_length=1, max_length=50)
+    package_type: str = Field(default="", max_length=100)
+    product_configurations: list[ProductCategorySelection] = Field(default_factory=list, max_length=50)
+    quantity: int = Field(ge=1, le=99)
+
+
+class CartCheckout(BaseModel):
+    items: list[CartCheckoutItem] = Field(min_length=1, max_length=50)
+
+
+class ServiceInstanceOut(BaseModel):
+    id: int
+    application_no: str
+    instance_index: int
+    company_name: str | None = None
+    status: ApplicationStatus
+    registration_number: str | None = None
+    certificate_file: str | None = None
+    invoice_file: str | None = None
+    result_file: str | None = None
+    service_expiry_date: str | None = None
+    delivery_stage: str | None = None
+    countersign_note: str | None = None
+    countersign_file: str | None = None
+    countersign_required: bool = False
+
+
+class PurchaseOrderOut(BaseModel):
+    id: int
+    order_no: str
+    service: CatalogServiceOut
+    service_year: str
+    subject_type: str = ""
+    package_type: str = ""
+    product_configurations: list[ProductCategorySelection] = Field(default_factory=list)
+    quantity: int
+    unit_price: int
+    batch_no: str | None = None
+    standard_amount: int
+    discount_amount: int
+    discount_reason: str | None = None
+    total_amount: int
+    status: PurchaseOrderStatus
+    payment_method: str | None
+    payer_name: str | None
+    payment_proof: str | None
+    actual_paid_amount: int | None = None
+    finance_receipt: str | None = None
+    finance_note: str | None = None
+    contract_no: str | None = None
+    contract_file: str | None = None
+    contract_version: str | None = None
+    customer_signed_contract_file: str | None = None
+    signed_contract_uploaded_time: datetime | None = None
+    application_id: int | None
+    service_instances: list[ServiceInstanceOut] = Field(default_factory=list)
+    service_progress: str | None = None
+    created_time: datetime
+    paid_time: datetime | None
+
+
+class PurchaseOrderPay(BaseModel):
+    payment_method: str = Field(default="OFFLINE", pattern="^OFFLINE$")
+    payer_name: str | None = Field(default=None, max_length=150)
+    payment_proof: str | None = Field(default=None, max_length=500)
+    order_ids: list[int] = Field(default_factory=list, max_length=50)
+
+
+class AdminPaymentReview(BaseModel):
+    approved: bool
+    note: str | None = Field(default=None, max_length=500)
+    actual_paid_amount: int | None = Field(default=None, ge=0)
+    finance_receipt: str | None = Field(default=None, max_length=500)
+
+
+class AdminOrderCreate(PurchaseOrderCreate):
+    user_id: int
+
+
+class AdminPackageDiscount(BaseModel):
+    order_ids: list[int] = Field(min_length=1, max_length=50)
+    package_total: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class AdminContractUpdate(BaseModel):
+    contract_no: str = Field(min_length=1, max_length=80)
+    contract_file: str = Field(min_length=1, max_length=500)
+    contract_version: str = Field(default="V1", min_length=1, max_length=30)
+
+    @field_validator("contract_file")
+    @classmethod
+    def contract_must_be_pdf(cls, value: str) -> str:
+        if not value.split("?", 1)[0].lower().endswith(".pdf"):
+            raise ValueError("合同文件必须是 PDF 格式")
+        return value
+
+
+class CustomerSignedContractUpdate(BaseModel):
+    signed_contract_file: str = Field(min_length=1, max_length=500)
+
+    @field_validator("signed_contract_file")
+    @classmethod
+    def signed_contract_must_be_pdf(cls, value: str) -> str:
+        if not value.split("?", 1)[0].lower().endswith(".pdf"):
+            raise ValueError("回签合同必须是 PDF 格式")
+        return value
+
+
+class CustomerCountersignUpdate(BaseModel):
+    countersign_file: str = Field(min_length=1, max_length=500)
+
+    @field_validator("countersign_file")
+    @classmethod
+    def countersign_must_be_pdf(cls, value: str) -> str:
+        if not value.split("?", 1)[0].lower().endswith(".pdf"):
+            raise ValueError("二次回签文件必须是 PDF 格式")
+        return value
+
+
+class AdminPurchaseOrderOut(PurchaseOrderOut):
+    customer_name: str
+    customer_account: str

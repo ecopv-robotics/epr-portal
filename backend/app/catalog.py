@@ -1,3 +1,6 @@
+from app.portal_catalog import GERMANY_WEEE_CATEGORIES
+
+
 EUROPEAN_COUNTRIES = [
     ("Albania", "阿尔巴尼亚"), ("Andorra", "安道尔"), ("Armenia", "亚美尼亚"),
     ("Austria", "奥地利"), ("Azerbaijan", "阿塞拜疆"), ("Belarus", "白俄罗斯"),
@@ -47,18 +50,6 @@ PRODUCT_FIELDS = {
         ("annual_quantity", "预计年销售量", "number", True, None),
     ],
 }
-
-GERMANY_WEEE_CATEGORIES = [
-    "热交换设备",
-    "屏幕设备",
-    "气体放电灯",
-    "非气体放电灯",
-    "大型设备，单边尺寸大于50cm",
-    "小型设备，单边尺寸小于50cm",
-    "小型信息和电信设备",
-    "大型光伏，单边尺寸大于50cm",
-    "小型光伏，单边尺寸小于50cm",
-]
 
 # 国家 + 服务的字段差异集中在模板配置层，业务接口与前端不写国家分支。
 COUNTRY_SERVICE_PRODUCT_FIELDS = {

@@ -9,12 +9,12 @@ import api from '../api'
 import type { Application, ApplicationList, ApplicationStatus } from '../types'
 
 const statusMeta: Record<ApplicationStatus, { label: string; color: string }> = {
-  DRAFT: { label: '草稿', color: 'default' }, SUBMITTED: { label: '已提交', color: 'blue' },
+  DRAFT: { label: '草稿', color: 'default' }, SUBMITTED: { label: '待审核', color: 'blue' },
   REVIEWING: { label: '审核中', color: 'processing' }, NEED_FIX: { label: '待补资料', color: 'warning' }, COMPLETED: { label: '已完成', color: 'success' },
   REGISTERING: { label: '注册中', color: 'cyan' },
 }
 
-export default function ApplicationsPage() {
+export default function ApplicationsPage({ title = '我的订单', description = '管理和跟踪您的 EPR 注册申请' }: { title?: string; description?: string }) {
   const navigate = useNavigate()
   const [data, setData] = useState<ApplicationList>({ items: [], total: 0, page: 1, page_size: 10 })
   const [loading, setLoading] = useState(true)
@@ -35,9 +35,9 @@ export default function ApplicationsPage() {
   ]
 
   return <div className="page-container">
-    <div className="page-heading"><div><Typography.Title level={2}>我的递单</Typography.Title><Typography.Text type="secondary">管理和跟踪您的 EPR 注册申请</Typography.Text></div><Button type="primary" size="large" icon={<PlusOutlined />} onClick={() => navigate('/application/create')}>新建递单</Button></div>
+    <div className="page-heading"><div><Typography.Title level={2}>{title}</Typography.Title><Typography.Text type="secondary">{description}</Typography.Text></div><Button type="primary" size="large" icon={<PlusOutlined />} onClick={() => navigate('/services')}>购买服务</Button></div>
     <Card className="data-card">
-      <div className="table-toolbar"><Segmented value={statusFilter} onChange={(value) => setStatusFilter(value as 'ALL' | ApplicationStatus)} options={[{ label: `全部 (${data.total})`, value: 'ALL' }, { label: `草稿 (${count('DRAFT')})`, value: 'DRAFT' }, { label: `已提交 (${count('SUBMITTED')})`, value: 'SUBMITTED' }, { label: `审核中 (${count('REVIEWING')})`, value: 'REVIEWING' }, { label: `待补资料 (${count('NEED_FIX')})`, value: 'NEED_FIX' }, { label: `注册中 (${count('REGISTERING')})`, value: 'REGISTERING' }, { label: `已完成 (${count('COMPLETED')})`, value: 'COMPLETED' }]} /><Input allowClear prefix={<SearchOutlined />} placeholder="申请编号 / 公司 / 注册号 / 国家 / 服务" value={query} onChange={(e) => setQuery(e.target.value)} /></div>
+      <div className="table-toolbar"><Segmented value={statusFilter} onChange={(value) => setStatusFilter(value as 'ALL' | ApplicationStatus)} options={[{ label: `全部 (${data.total})`, value: 'ALL' }, { label: `草稿 (${count('DRAFT')})`, value: 'DRAFT' }, { label: `待审核 (${count('SUBMITTED')})`, value: 'SUBMITTED' }, { label: `审核中 (${count('REVIEWING')})`, value: 'REVIEWING' }, { label: `待补资料 (${count('NEED_FIX')})`, value: 'NEED_FIX' }, { label: `注册中 (${count('REGISTERING')})`, value: 'REGISTERING' }, { label: `已完成 (${count('COMPLETED')})`, value: 'COMPLETED' }]} /><Input allowClear prefix={<SearchOutlined />} placeholder="申请编号 / 公司 / 注册号 / 国家 / 服务" value={query} onChange={(e) => setQuery(e.target.value)} /></div>
       <Table rowKey="id" columns={columns} dataSource={filtered} loading={loading} locale={{ emptyText: <Empty description="暂无递单，创建第一份 EPR 申请吧" /> }} pagination={{ total: filtered.length, pageSize: 10, showTotal: (total) => `共 ${total} 条` }} />
     </Card>
   </div>
