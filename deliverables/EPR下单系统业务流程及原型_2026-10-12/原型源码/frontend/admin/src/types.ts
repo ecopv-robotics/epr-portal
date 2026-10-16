@@ -1,0 +1,20 @@
+export type ApplicationStatus = 'DRAFT'|'SUBMITTED'|'REVIEWING'|'NEED_FIX'|'REGISTERING'|'COMPLETED'
+export interface User { id:number; username:string; email?:string; role:'ADMIN'|'STAFF'|'CUSTOMER' }
+export interface Application { id:number; application_no:string; purchase_order_id?:number; instance_index?:number; company_name?:string; agent_name?:string; country:string; service_type:string; status:ApplicationStatus; created_time:string; submitted_time?:string; review_note?:string; registration_number?:string; certificate_file?:string; invoice_file?:string; result_file?:string; service_expiry_date?:string }
+export interface ApplicationList { items:Application[]; total:number; page:number; page_size:number }
+export interface DynamicField { id?:number; field_name:string; label:string; field_type:string; required:boolean; options?:string[]; sort:number }
+export interface MaterialRule { id?:number; material_name:string; required:boolean; file_type:string; description:string; sort:number }
+export interface Template { id:number; country:string; service_type:string; version:number; fields:DynamicField[]; materials:MaterialRule[] }
+export interface MaterialFile { id:number; requirement_id:number; file_url:string; original_name:string; auto_synced?:boolean }
+export interface ApplicationForm { application:Application; template:Template; company?:Record<string,unknown>&{legal_person?:Record<string,unknown>}; store?:Record<string,unknown>; products:{id?:number;product_data:Record<string,string|number>}[]; material_files:MaterialFile[] }
+export interface Dashboard { total:number; submitted:number; reviewing:number; need_fix:number; completed:number; my_tasks:number }
+export interface Role { id:number; code:string; name:string; permissions:string[] }
+export interface Employee { id:number; username:string; email?:string; display_name:string; active:boolean; role:Role }
+export interface Assignment { id:number; application_id:number; employee_id:number; employee_name:string; assigned_by_name:string; assigned_time:string }
+export interface StatusHistory { id:number; from_status:string; to_status:string; note?:string; operator_name:string; created_time:string }
+export interface CustomerAccount { id:number; user_id:number; customer_type:'AGENT'|'DIRECT'; name:string; username:string; email?:string; contact_name?:string; contact_phone?:string; active:boolean; order_count:number; company_count:number; created_time:string }
+export interface CustomerCompany { id:number; company_name:string; company_name_en?:string; registration_region?:string; company_type?:string; register_number?:string; application_count:number; completeness:number; created_time:string }
+export interface CustomerAccountDetail { account:CustomerAccount; applications:Application[]; companies:CustomerCompany[] }
+export type PurchaseOrderStatus='PENDING'|'PAYMENT_CONFIRMING'|'PAID'|'CANCELLED'|'PAYMENT_FAILED'|'PARTIALLY_REFUNDED'|'REFUNDED'
+export interface ServiceInstance { id:number; application_no:string; instance_index:number; company_name?:string; status:ApplicationStatus; registration_number?:string; certificate_file?:string; service_expiry_date?:string }
+export interface AdminPurchaseOrder { id:number; order_no:string; customer_name:string; customer_account:string; service:{id:string;title:string;country:string;product_type:string}; service_year:string; quantity:number; unit_price:number; batch_no?:string; standard_amount:number; discount_amount:number; discount_reason?:string; total_amount:number; status:PurchaseOrderStatus; payment_method?:string; payer_name?:string; payment_proof?:string; actual_paid_amount?:number; finance_receipt?:string; finance_note?:string; contract_no?:string; contract_file?:string; contract_version?:string; service_instances:ServiceInstance[]; service_progress?:ApplicationStatus; created_time:string; paid_time?:string }
